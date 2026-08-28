@@ -12,9 +12,11 @@ Alur lengkap ada di [`genspark_flow.md`](genspark_flow.md).
 | `solvers.py` | captcha solver (2captcha, capsolver, dll) |
 | `proxies.py` | pool proxy + round-robin, semua tipe |
 | `test_har.py` | self-check parsing terhadap HAR + regression test |
+| `SETUP.md` | langkah pakai di device baru |
 | `genspark_flow.md` | dokumentasi endpoint dan alurnya |
 
-Hanya pustaka standar Python, kecuali `PySocks` kalau memakai proxy SOCKS.
+Hanya pustaka standar Python. `PySocks` (lihat `requirements.txt`)
+opsional, dibutuhkan hanya untuk proxy SOCKS.
 
 ## Pakai
 

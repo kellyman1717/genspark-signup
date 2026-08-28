@@ -1,0 +1,8 @@
+# Tak ada dependensi wajib: alur inti memakai pustaka standar Python saja.
+#
+# Satu paket opsional, hanya kalau PROXY memakai skema socks4/socks4a/
+# socks5/socks5h. Proxy http/https jalan dengan stdlib (urllib ProxyHandler).
+#
+#   pip install -r requirements.txt
+#
+PySocks>=1.7.1

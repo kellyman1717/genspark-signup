@@ -4,10 +4,17 @@
 
 - **Python 3.8+** — cek: `py --version`
 - **Git** — untuk clone
-- **PySocks** — hanya kalau memakai proxy SOCKS: `pip install PySocks`
 
-Selain itu semuanya pustaka standar Python. Tak ada `requirements.txt` karena
-tak ada dependensi wajib.
+Alur inti memakai pustaka standar Python saja, jadi tanpa install apa pun sudah
+jalan. Satu paket opsional (`PySocks`) hanya dibutuhkan kalau `PROXY` memakai
+skema `socks4`/`socks5`; proxy `http`/`https` jalan dengan stdlib.
+
+```bat
+pip install -r requirements.txt    :: hanya kalau pakai proxy SOCKS
+```
+
+Tanpa itu, proxy SOCKS berhenti dengan pesan yang menyebutkan paketnya:
+`proxy socks5 butuh PySocks: pip install PySocks`
 
 ## 2. Clone dan konfigurasi
 
