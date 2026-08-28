@@ -8,7 +8,7 @@ Format di proxy.txt / .env (satu per baris, koma juga boleh):
     1.2.3.4:8080                    # tanpa skema -> dianggap http
     1.2.3.4:8080:user:pass          # format host:port:user:pass
 """
-import itertools, os, threading, urllib.parse, urllib.request
+import itertools, os, socket, threading, urllib.error, urllib.parse, urllib.request
 
 DEFAULT_SCHEME = "http"
 SOCKS = ("socks4", "socks4a", "socks5", "socks5h")
@@ -64,6 +64,30 @@ def load(env_value="", path=None):
             seen.add(p)
             uniq.append(p)
     return uniq
+
+
+def is_network_error(ex):
+    """True kalau kegagalan berasal dari jaringan/proxy, bukan jawaban server.
+
+    Proxy busuk muncul sebagai URLError: "Tunnel connection failed: 400 Bad
+    Request" (proxy tolak CONNECT) atau WinError 10060 (proxy diam). Keduanya
+    layak dicoba ulang dengan proxy lain. HTTPError DIKECUALIKAN: itu jawaban
+    sah dari server tujuan, ganti IP tak mengubah apa pun.
+    """
+    if isinstance(ex, urllib.error.HTTPError):
+        return False
+    if isinstance(ex, (urllib.error.URLError, socket.timeout, ConnectionError,
+                       TimeoutError)):
+        return True
+    if isinstance(ex, OSError):
+        return True
+    # req() membungkus sebagian error jadi RuntimeError -> cocokkan teksnya
+    text = str(ex).lower()
+    return any(k in text for k in (
+        "tunnel connection failed", "urlopen error", "winerror 100",
+        "proxy", "timed out", "connection reset", "connection aborted",
+        "connection refused", "socks", "remote end closed",
+    ))
 
 
 class Pool:
@@ -149,7 +173,20 @@ def demo():
 
     assert build_opener(None) is not None
     assert build_opener("http://1.2.3.4:8080") is not None
-    print("PASS: proxy parsing + round-robin OK")
+
+    # error jaringan/proxy -> boleh ganti proxy
+    for e in (urllib.error.URLError("Tunnel connection failed: 400 Bad Request"),
+              urllib.error.URLError("[WinError 10060] no response"),
+              socket.timeout("timed out"),
+              ConnectionResetError("connection reset by peer"),
+              RuntimeError("<urlopen error Tunnel connection failed>")):
+        assert is_network_error(e), e
+    # jawaban server -> jangan ganti proxy, tak ada gunanya
+    for e in (urllib.error.HTTPError("http://x", 500, "boom", {}, None),
+              RuntimeError("SelfAsserted failed: ViralErrorUserCreationConflict"),
+              ValueError("captcha salah")):
+        assert not is_network_error(e), e
+    print("PASS: proxy parsing, round-robin, deteksi error OK")
 
 
 if __name__ == "__main__":

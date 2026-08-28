@@ -184,6 +184,59 @@ def test_proxy_real():
     print("PASS: request benar-benar lewat proxy")
 
 
+def test_proxy_retry():
+    """Proxy mati -> ganti proxy. Error server -> jangan ganti (boros captcha)."""
+    import urllib.error, proxies, signup
+
+    orig_pool, orig_tries, orig_log = signup.PROXY_POOL, signup.PROXY_TRIES, signup.log
+    signup.PROXY_POOL = proxies.Pool(["http://p1:80", "http://p2:80", "http://p3:80"])
+    signup.PROXY_TRIES = 4
+    signup.log = lambda *a: None
+    try:
+        # dua proxy mati, ketiga hidup -> sukses lewat proxy ketiga
+        seen = []
+
+        def fn(proxy):
+            seen.append(proxy)
+            if len(seen) < 3:
+                raise urllib.error.URLError("Tunnel connection failed: 400 Bad Request")
+            return "ok"
+
+        assert signup.with_proxy_retry(fn, "a@b.c") == "ok"
+        assert seen == ["http://p1:80", "http://p2:80", "http://p3:80"], seen
+
+        # error server -> satu percobaan saja, tak ganti proxy
+        calls = []
+
+        def server_err(proxy):
+            calls.append(proxy)
+            raise RuntimeError("SelfAsserted failed: ViralErrorUserCreationConflict")
+
+        try:
+            signup.with_proxy_retry(server_err, "a@b.c")
+            raise AssertionError("error server harus langsung raise")
+        except RuntimeError as ex:
+            assert "Conflict" in str(ex)
+        assert len(calls) == 1, calls
+
+        # NeedsHuman lewat tanpa muter proxy -> akun baru langsung ke fase 2
+        calls.clear()
+
+        def needs(proxy):
+            calls.append(proxy)
+            raise signup.NeedsHuman("baru@b.c")
+
+        try:
+            signup.with_proxy_retry(needs, "baru@b.c")
+            raise AssertionError("NeedsHuman harus naik")
+        except signup.NeedsHuman:
+            pass
+        assert len(calls) == 1, calls
+    finally:
+        signup.PROXY_POOL, signup.PROXY_TRIES, signup.log = orig_pool, orig_tries, orig_log
+    print("PASS: retry ganti proxy hanya untuk error jaringan")
+
+
 def main():
     if not os.path.exists(HAR):
         print("SKIP: HAR not found")
@@ -241,6 +294,7 @@ def main():
     test_dotenv()
     test_conflict_retry()
     test_proxy_real()
+    test_proxy_retry()
     return 0
 
 

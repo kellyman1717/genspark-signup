@@ -363,7 +363,7 @@ Komentar (`#`) boleh di awal baris atau di ujung baris.
 
 `proxies.Pool` bergilir dan thread-safe (`itertools.cycle` sendirinya tidak, jadi dikunci).
 
-**Satu akun = satu proxy, konsisten sepanjang alurnya** — `Client`, inbox Emailnator, dan alamat pengganti saat conflict semuanya pakai IP yang sama. Alasannya: B2C mengikat transaksi ke IP; ganti IP di tengah alur bikin transaksi ditolak.
+**Satu proxy dipegang sepanjang satu percobaan** — `Client` dan inbox Emailnator memakai IP yang sama. Alasannya: B2C mengikat transaksi ke IP; ganti IP di tengah alur bikin transaksi ditolak.
 
 Pool kosong -> koneksi langsung. IP yang dipakai tercatat di `accounts.json` (field `proxy`).
 
@@ -400,3 +400,29 @@ Verifikasi manual:
 py signup.py credit
 ```
 `plan=plus` + `status=active` = pembayaran benar-benar masuk.
+
+### Retry ganti proxy
+
+Proxy publik banyak yang mati. Kalau koneksi gagal, `with_proxy_retry()` mengambil proxy berikutnya dari pool dan mengulang percobaan itu dari awal (sesi B2C baru), sampai `PROXY_TRIES` (default 4).
+
+```
+[x@gmail.com] proxy bermasalah (Tunnel connection failed: 400 Bad Request), ganti proxy [1/4]
+[x@gmail.com] proxy bermasalah ([WinError 10060] ...), ganti proxy [2/4]
+```
+
+Yang diulang **hanya** error jaringan:
+
+| Gejala | Arti | Tindakan |
+|---|---|---|
+| `Tunnel connection failed: 400` | proxy tolak CONNECT (HTTPS tak didukung / auth kurang) | ganti proxy |
+| `WinError 10060` timeout | proxy diam / kelebihan beban | ganti proxy |
+| `connection reset` / `refused` | proxy tutup koneksi | ganti proxy |
+| HTTP 4xx/5xx dari Genspark | jawaban sah server | **jangan** ganti, langsung gagal |
+| `ViralErrorUserCreationConflict` | email sudah dipakai | tukar alamat, bukan proxy |
+| captcha salah | solver salah baca | ambil captcha baru |
+
+Pembeda ada di `proxies.is_network_error()`. `HTTPError` sengaja dikecualikan: ganti IP tak mengubah jawaban server, dan mengulang percobaan cuma memboroskan kuota captcha.
+
+Pool kosong -> satu percobaan saja, tanpa retry.
+
+Tambahan `.env`: `PROXY_TRIES=4`.

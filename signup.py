@@ -55,6 +55,8 @@ WORKERS = int(ENV.get("WORKERS", "6"))       # paralel untuk fase jaringan
 # Tipe: http, https, socks4, socks4a, socks5, socks5h. Kosong -> koneksi langsung.
 PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.txt")
 PROXY_POOL = proxies.Pool(proxies.load(ENV.get("PROXY", ""), PROXY_FILE))
+# proxy publik banyak yang mati; coba proxy lain sebanyak ini kalau koneksi gagal
+PROXY_TRIES = int(ENV.get("PROXY_TRIES", "4"))
 PASSWORD = ENV.get("PASSWORD", "Masuk@123456")  # password semua akun
 IO_LOCK = threading.Lock()  # accounts.json + stdout
 
@@ -360,6 +362,29 @@ def log(msg):
         print(msg, flush=True)
 
 
+def with_proxy_retry(fn, email, tries=None):
+    """Jalankan fn(proxy) dengan proxy dari pool; ganti proxy kalau koneksi gagal.
+
+    Hanya error jaringan yang diulang. Jawaban server (HTTP 4xx/5xx, conflict,
+    captcha salah) langsung dilempar: ganti IP tak mengubah hasilnya, dan
+    mengulanginya cuma memboroskan captcha.
+    """
+    if tries is None:
+        tries = PROXY_TRIES if len(PROXY_POOL) else 1
+    last = None
+    for n in range(1, tries + 1):
+        proxy = PROXY_POOL.next()
+        try:
+            return fn(proxy)
+        except Exception as ex:
+            if not proxies.is_network_error(ex) or n == tries:
+                raise
+            last = ex
+            log(f"  [{email}] proxy bermasalah ({str(ex)[:60]}), ganti proxy "
+                f"[{n}/{tries}]")
+    raise last
+
+
 class NeedsHuman(Exception):
     """Akun belum ada -> perlu jalur signup (captcha + OTP)."""
     def __init__(self, email):
@@ -369,11 +394,14 @@ class NeedsHuman(Exception):
 
 def phase_auth(email):
     """Paralel-safe: login akun existing. Raise NeedsHuman kalau akun baru."""
-    c = Client()
-    c.start()
-    if c.login(email):
-        return c, c.get_user()["data"]["cogen"], "login"
-    raise NeedsHuman(email)
+    def once(proxy):
+        c = Client(proxy)
+        c.start()
+        if c.login(email):
+            return c, c.get_user()["data"]["cogen"], "login"
+        raise NeedsHuman(email)
+
+    return with_proxy_retry(once, email)
 
 
 def solve_captcha(c, email):
@@ -446,10 +474,12 @@ def interactive_signup(email, tries=EMAIL_TRIES):
     emailnator, ambil alamat lain lalu ulangi -- alamat itu memang sekali pakai.
     """
     auto_mail = EMAIL_SOURCE.lower() == "emailnator"
-    proxy = PROXY_POOL.next()   # satu IP untuk seluruh percobaan akun ini
+    proxy = PROXY_POOL.next()   # satu IP dipegang sepanjang SATU percobaan
     for n in range(1, tries + 1):
         try:
-            c, cogen = _signup_once(email, proxy)
+            # proxy mati -> ganti IP dan mulai transaksi baru; itu sah karena
+            # tiap percobaan memang membuka sesi B2C sendiri
+            c, cogen = with_proxy_retry(lambda pr: _signup_once(email, pr), email)
             return email, c, cogen
         except RuntimeError as ex:
             if CONFLICT not in str(ex) or n == tries:
@@ -461,7 +491,7 @@ def interactive_signup(email, tries=EMAIL_TRIES):
                     f"{email} sudah terdaftar tapi password bukan '{PASSWORD}'. "
                     "Set PASSWORD di .env sesuai akun itu, atau pakai email lain."
                 ) from None
-            baru = mailer.Emailnator(proxy=proxy).new_email()
+            baru = mailer.Emailnator(proxy=PROXY_POOL.next()).new_email()
             log(f"  [{email}] sudah dipakai -> tukar ke {baru}")
             record_emails([baru])
             email = baru
