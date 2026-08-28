@@ -92,7 +92,7 @@ def fresh_email(mail, avoid=(), tries=6):
     """Alamat emailnator yang inbox-nya belum pernah dipakai.
 
     Emailnator mengacak titik pada nama yang sama, jadi ia bisa memberi
-    "x.z.e.r.afro.st@" padahal "x.ze.r.a.fro.s.t@" sudah punya akun -- Gmail
+    "a.n.disan.t.o@" padahal "an.d.i.santo@" sudah punya akun -- Gmail
     mengabaikan titik, jadi keduanya satu inbox dan signup kena conflict.
     """
     for _ in range(tries):

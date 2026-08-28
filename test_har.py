@@ -374,30 +374,30 @@ def test_gmail_dedupe():
     bisa memberi alamat yang inbox-nya sudah punya akun -> conflict."""
     import importlib, os as _os, tempfile, signup, mailer
 
-    assert signup.gmail_key("x.z.e.r.afro.s.t@gmail.com") == \
-        signup.gmail_key("x.ze.r.a.fro.s.t@gmail.com") == "xzerafrost@gmail.com"
+    assert signup.gmail_key("a.n.dis.a.n.t.o@gmail.com") == \
+        signup.gmail_key("an.d.i.santo@gmail.com") == "andisanto@gmail.com"
     assert signup.gmail_key("A.B@Gmail.COM") == "ab@gmail.com"
 
     # fresh_email harus melewati alamat yang inbox-nya sudah dipakai
-    urut = iter(["x.z.e.r.afro.st@gmail.com",     # inbox sama -> dilewati
-                 "xz.e.rafrost@gmail.com",        # inbox sama -> dilewati
+    urut = iter(["a.n.disan.t.o@gmail.com",     # inbox sama -> dilewati
+                 "an.disan.to@gmail.com",        # inbox sama -> dilewati
                  "orang.b.aru@gmail.com"])        # inbox baru -> dipakai
 
     class M:
         def new_email(self):
             return next(urut)
 
-    em = signup.fresh_email(M(), {"xzerafrost@gmail.com"})
+    em = signup.fresh_email(M(), {"andisanto@gmail.com"})
     assert em == "orang.b.aru@gmail.com", em
 
     # kalau semua tabrakan, tetap kembalikan sesuatu (alur conflict yang urus),
     # jangan menggantung atau melempar
     class Same:
         def new_email(self):
-            return "x.zerafrost@gmail.com"
+            return "a.ndisanto@gmail.com"
 
-    em = signup.fresh_email(Same(), {"xzerafrost@gmail.com"}, tries=3)
-    assert em == "x.zerafrost@gmail.com"
+    em = signup.fresh_email(Same(), {"andisanto@gmail.com"}, tries=3)
+    assert em == "a.ndisanto@gmail.com"
 
     # used_inboxes membaca akun.txt DAN accounts.json
     d = tempfile.mkdtemp()

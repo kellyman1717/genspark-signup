@@ -457,7 +457,7 @@ Dulu keduanya memakai satu nilai, jadi `TIMEOUT=5` demi proxy ikut memutus pemba
 
 Gmail mengabaikan titik: `a.b@gmail.com` dan `ab@gmail.com` adalah inbox yang **sama**, dan karena Genspark memakai email sebagai identitas, keduanya juga akun yang sama.
 
-Emailnator mengacak posisi titik pada nama yang sama, jadi ia bisa memberi `x.z.e.r.afro.s.t@gmail.com` padahal `x.ze.r.a.fro.s.t@gmail.com` sudah punya akun. Hasilnya `ViralErrorUserCreationConflict` yang membingungkan -- alamatnya kelihatan baru, tapi inbox-nya bukan.
+Emailnator mengacak posisi titik pada nama yang sama, jadi ia bisa memberi `a.n.dis.a.n.t.o@gmail.com` padahal `an.d.i.santo@gmail.com` sudah punya akun. Hasilnya `ViralErrorUserCreationConflict` yang membingungkan -- alamatnya kelihatan baru, tapi inbox-nya bukan.
 
 `gmail_key()` menormalkan alamat (buang titik, huruf kecil), lalu `used_inboxes()` mengumpulkan kunci dari `accounts.json` **dan** `akun.txt`. `fresh_email()` meminta alamat baru sampai inbox-nya belum terpakai (maksimal 6 kali), termasuk mencegah tabrakan di dalam satu batch. Kalau tetap tabrakan, alur tukar-alamat yang menangani.
 
