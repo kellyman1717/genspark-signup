@@ -463,6 +463,65 @@ def test_no_head_of_line_block():
     print("PASS: akun cepat tak tertahan akun lambat")
 
 
+def test_wait_credit():
+    """Credit langganan menyusul setelah plan naik: membaca saldo tepat setelah
+    pembayaran bisa memberi 100 (bonus akun gratis), bukan kuota langganan."""
+    import signup
+
+    c = signup.Client.__new__(signup.Client)      # tanpa jaringan
+    seq = iter([100, 100, 10100])                 # 100 dulu, lalu kuota masuk
+    c.credit_balance = lambda: next(seq)
+    got = c.wait_credit(floor=200, timeout=30, interval=0, email="x@g.com")
+    assert got == 10100, got
+
+    # saldo sudah di atas batas -> langsung pakai, jangan menunggu
+    c.credit_balance = lambda: 9985
+    assert c.wait_credit(floor=200, timeout=30, interval=0) == 9985
+
+    # tak pernah masuk -> kembalikan apa adanya, jangan menggantung/melempar
+    logs = []
+    orig_log, signup.log = signup.log, logs.append
+    try:
+        c.credit_balance = lambda: 100
+        assert c.wait_credit(floor=200, timeout=0.2, interval=0.1,
+                             email="x@g.com") == 100
+        assert any("masih 100" in x for x in logs), logs
+    finally:
+        signup.log = orig_log
+    print("PASS: credit ditunggu sampai kuota langganan masuk")
+
+
+def test_coupon_fallback():
+    """Coupon first_month bisa ditolak (wallet_coupon_unavailable) -> ulang
+    tanpa coupon, jangan menggagalkan akun yang pembayarannya masih bisa jalan."""
+    import inspect, signup
+
+    src = inspect.getsource(signup.phase_finish)
+    assert "COUPON_UNAVAILABLE" in src, "penolakan coupon harus ditangani"
+    assert src.count("create_checkout(") == 2, \
+        "harus ada percobaan kedua tanpa coupon"
+    assert "TANPA diskon" in src, "harga penuh wajib diberitahukan"
+
+    # error checkout selain coupon jangan ditelan
+    calls = []
+
+    class C:
+        proxy = None
+
+        def create_checkout(self, *a, **kw):
+            calls.append(kw.get("coupon_key"))
+            raise RuntimeError("create-checkout failed: {'status': -9, "
+                               "'message': 'server error'}")
+
+    try:
+        signup.phase_finish("x@g.com", C(), {"id": "1", "plan": "free"}, {})
+        raise AssertionError("error non-coupon harus naik")
+    except RuntimeError as ex:
+        assert "server error" in str(ex), str(ex)
+    assert len(calls) == 1, calls      # tak mencoba ulang untuk error lain
+    print("PASS: coupon ditolak -> lanjut tanpa diskon, error lain tetap naik")
+
+
 def main():
     if not os.path.exists(HAR):
         print("SKIP: HAR not found")
@@ -526,6 +585,8 @@ def main():
     test_wait_otp_stops()
     test_gmail_dedupe()
     test_no_head_of_line_block()
+    test_wait_credit()
+    test_coupon_fallback()
     return 0
 
 

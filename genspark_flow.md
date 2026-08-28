@@ -103,7 +103,8 @@ decodes to: `{"TID":"ba1c4088-492f-462c-b8da-c5077c89a2ff"}`
 - Challenge ID: UUID
 
 ### Password
-Observed: `Masuk@123456` (hardcoded in signup)
+Diisi dari `PASSWORD` di `.env`. Syarat Azure B2C: huruf besar + kecil,
+angka, simbol, minimal 8 karakter. Tak ada nilai default di kode.
 
 ## Session Flow
 
@@ -293,7 +294,7 @@ EMAIL_COUNT=3
 | `EMAIL_COUNT` | `1` | jumlah akun kalau `emailnator` |
 | `OTP_TIMEOUT` | `300` | detik menunggu OTP |
 | `WORKERS` | `6` | worker paralel |
-| `PASSWORD` | `Masuk@123456` | password semua akun |
+| `PASSWORD` | (wajib diisi) | password semua akun |
 
 Env var proses menimpa `.env`, jadi `set EMAIL_COUNT=5` tetap berlaku untuk sekali jalan.
 
@@ -324,7 +325,7 @@ Penanganan:
 - `EMAIL_SOURCE=emailnator` -> ambil alamat baru, ulangi sampai `EMAIL_TRIES` (default 3). Alamat memang sekali pakai, jadi menukar itu benar. Alamat pengganti dicatat ke `akun.txt`, dan `accounts.json` menyimpan alamat yang benar-benar dipakai.
 - `EMAIL_SOURCE=file` -> **tidak** ditukar (alamat itu milikmu). Pesannya:
   ```
-  x@gmail.com sudah terdaftar tapi password bukan 'Masuk@123456'.
+  x@gmail.com sudah terdaftar tapi password bukan '<PASSWORD di .env>'.
   Set PASSWORD di .env sesuai akun itu, atau pakai email lain.
   ```
 
@@ -518,3 +519,37 @@ Sekarang: `body()` dibungkus, dan hanya pesan yang **jelas bukan** dari pengirim
 Lima akun berarti lima tab checkout. Karena kartu diisi manusia satu per satu, tab dibuka berjarak `TAB_DELAY` detik (default 3) sambil polling tetap paralel.
 
 Tambahan `.env`: `TAB_DELAY=3`.
+
+## Credit tercatat 100 padahal plan sudah plus
+
+Setelah pembayaran, Genspark menaikkan `plan` ke `plus` **lebih dulu** daripada mengkreditkan kuota langganan. `wait_paid()` berhenti begitu `plan != free`, jadi saldo yang terbaca sesaat kemudian masih 100 -- itu bonus akun gratis, bukan kuota langganan.
+
+Terbukti pada satu akun: tercatat `credit=100` saat berjalan, padahal saldo sesungguhnya 9985.
+
+`wait_credit()` menunggu saldo melewati `FREE_CREDIT` (default 200) sampai 120 detik. Kalau tetap belum masuk, nilainya disimpan apa adanya dengan catatan supaya bisa diperbarui nanti:
+
+```bat
+py signup.py credit
+```
+
+Perintah itu membaca ulang saldo semua akun dan memperbarui `accounts.json`, jadi nilai yang keliru dari run lama ikut terkoreksi.
+
+Tambahan `.env`: `FREE_CREDIT=200`.
+
+## Coupon first_month bisa ditolak
+
+```
+create-checkout failed: {'status': -2,
+  'message': "This coupon can't be used on this checkout.",
+  'data': {'code': 'wallet_coupon_unavailable'}}
+```
+
+Artinya coupon `first_month:<cogen_id>` tak berlaku untuk akun itu -- sudah pernah dipakai, atau akunnya tak memenuhi syarat.
+
+Dulu ini menggagalkan akun. Sekarang checkout diulang **tanpa coupon**, dan karena itu berarti tagihan harga penuh, hal itu diberitahukan:
+
+```
+[x@gmail.com] coupon first_month ditolak -> lanjut TANPA diskon ($24.99)
+```
+
+Error checkout selain penolakan coupon tetap dilempar apa adanya, tidak ditelan.

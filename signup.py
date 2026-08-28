@@ -34,7 +34,7 @@ def load_env(path=ENV_FILE):
         "CAPTCHA_PROVIDER", "CAPTCHA_KEY", "CAPTCHA_TRIES",
         "EMAIL_SOURCE", "EMAIL_COUNT", "EMAIL_TRIES", "OTP_TIMEOUT",
         "PROXY", "PROXY_TRIES", "TIMEOUT", "MAIL_TIMEOUT", "WORKERS",
-        "TAB_DELAY", "PASSWORD")})
+        "TAB_DELAY", "FREE_CREDIT", "PASSWORD")})
     return cfg
 
 
@@ -66,11 +66,16 @@ TIMEOUT = int(ENV.get("TIMEOUT", "5" if len(PROXY_POOL) else "30"))
 # (terukur), jadi TIMEOUT pendek bikin pembacaan inbox gagal terus.
 # Dipisah, dan tak pernah lebih pendek dari 20s.
 MAIL_TIMEOUT = max(int(ENV.get("MAIL_TIMEOUT", "30")), 20)
-PASSWORD = ENV.get("PASSWORD", "Masuk@123456")  # password semua akun
+# Password semua akun. WAJIB diisi di .env; tak ada default, supaya
+# password nyata tak pernah ikut tersimpan di dalam kode.
+PASSWORD = ENV.get("PASSWORD", "")
+SAMPLE_PASSWORD = "GantiIni@2026"  # hanya untuk pesan bantuan
 IO_LOCK = threading.Lock()   # accounts.json + stdout
 TAB_LOCK = threading.Lock()  # buka tab Stripe satu-satu
 # detik jeda antar tab checkout; kartu diisi manusia, jangan diserbu
 TAB_DELAY = float(ENV.get("TAB_DELAY", "3"))
+# saldo akun gratis. Credit di atas ini berarti kuota langganan sudah masuk.
+FREE_CREDIT = int(ENV.get("FREE_CREDIT", "200"))
 
 # Tier dari HAR /api/payment/sub2/tier_config. Ganti TIER_ID untuk paket lain.
 TIER_ID = "plus1"
@@ -385,6 +390,23 @@ class Client:
         except Exception:
             return -1
 
+    def wait_credit(self, floor=FREE_CREDIT, timeout=120, interval=5, email=""):
+        """Tunggu credit langganan masuk.
+
+        Plan naik ke plus lebih dulu daripada credit dikreditkan, jadi membaca
+        saldo tepat setelah pembayaran bisa memberi 100 -- bonus akun gratis,
+        bukan kuota langganan. Tunggu sampai saldo melewati batas akun gratis.
+        """
+        deadline = time.time() + timeout
+        bal = self.credit_balance()
+        while bal <= floor and time.time() < deadline:
+            time.sleep(interval)
+            bal = self.credit_balance()
+        if bal <= floor:
+            log(f"  [{email}] credit masih {bal} setelah {timeout}s; "
+                "cek lagi nanti dengan: py signup.py credit")
+        return bal
+
     def create_api_key(self, key_name):
         j = self.app_api("/api/api_tokens/create", {"key_name": key_name})
         if j.get("status") != 0:
@@ -508,6 +530,7 @@ def get_otp(email, proxy=None):
 
 
 CONFLICT = "ViralErrorUserCreationConflict"
+COUPON_UNAVAILABLE = "wallet_coupon_unavailable"
 
 
 def _signup_once(email, proxy=None):
@@ -567,9 +590,20 @@ def phase_finish(email, c, cogen, accounts):
         st = {"payment_status": "paid", "plan": cogen["plan"]}
         log(f"  [{email}] payment: sudah {cogen['plan']}, skip checkout")
     else:
-        url = c.create_checkout(TIER["price_id"], TIER["price_name"],
-                                TIER["plan_price"], "subscription",
-                                coupon_key=f"first_month:{cogen_id}")
+        # Coupon first_month tak selalu berlaku (wallet_coupon_unavailable):
+        # sudah pernah dipakai, atau akunnya tak memenuhi syarat. Kalau ditolak,
+        # ulang tanpa coupon -- tagihan jadi harga penuh, jadi ini diberitahukan.
+        try:
+            url = c.create_checkout(TIER["price_id"], TIER["price_name"],
+                                    TIER["plan_price"], "subscription",
+                                    coupon_key=f"first_month:{cogen_id}")
+        except RuntimeError as ex:
+            if COUPON_UNAVAILABLE not in str(ex):
+                raise
+            log(f"  [{email}] coupon first_month ditolak -> lanjut TANPA diskon "
+                f"(${TIER['plan_price']})")
+            url = c.create_checkout(TIER["price_id"], TIER["price_name"],
+                                    TIER["plan_price"], "subscription")
         session_id = re.search(r"cs_live_[A-Za-z0-9]+", url).group(0)
         # Kartu diisi manusia satu per satu: membuka lima tab serentak justru
         # menyulitkan. Tab dibuka berjarak, polling tetap jalan paralel.
@@ -582,7 +616,9 @@ def phase_finish(email, c, cogen, accounts):
 
     key_name = f"gk-{int(time.time() * 1000)}"
     token = c.create_api_key(key_name)
-    credit = c.credit_balance()
+    # credit langganan menyusul setelah plan naik, jadi ditunggu
+    credit = (c.wait_credit(email=email)
+              if st.get("payment_status") == "paid" else c.credit_balance())
     accounts[email] = {
         "email": cogen["email"],
         "cogen_id": cogen_id,
@@ -606,6 +642,11 @@ def main():
     accounts = load_accounts()
     todo = [e for e in emails if e not in accounts]
     print(f"{len(emails)} akun ({len(emails) - len(todo)} sudah selesai, {len(todo)} diproses)")
+    if not PASSWORD:
+        print("PASSWORD kosong. Isi di .env, mis. PASSWORD=" + repr(SAMPLE_PASSWORD)[1:-1])
+        print("Syarat Azure B2C: huruf besar + kecil, angka, simbol, min 8 karakter.")
+        return
+
     prov = (CAPTCHA_PROVIDER or "manual").lower()
     if prov == "manual":
         print("captcha: manual (ketik sendiri)")
