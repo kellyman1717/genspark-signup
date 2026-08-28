@@ -1,0 +1,402 @@
+# Genspark.ai Signup Flow (Azure AD B2C)
+
+## Overview
+Genspark uses Azure AD B2C with custom policy `B2C_1_new_login`. Signup flow is a SelfAsserted page with captcha + email OTP verification.
+
+## API Endpoints
+
+| # | Method | URL | Description |
+|---|--------|-----|-------------|
+| 1 | GET | `/api/login?legacy_b2c=true&redirect_url=...` | Initiate login -> 307 redirect to B2C authorize |
+| 2 | GET | `/b2c_1_new_login/oauth2/v2.0/authorize?...` | B2C authorize page (renders login HTML) |
+| 3 | GET | `/api/auth/login_template?v2` | Login template HTML |
+| 4 | GET | `/api/CombinedSigninAndSignup/unified?local=signup&csrf_token=...` | Signup page (contains CSRF + tx in window.SETTINGS) |
+| 5 | GET | `/api/auth/signup_template` | Signup details template |
+| 6 | GET | `/SelfAsserted/DisplayControlAction/vbeta/captchaControlChallengeCode/GetChallenge?tx=...` | Get captcha image (base64 JPEG) + challengeId |
+| 7 | POST | `/SelfAsserted/DisplayControlAction/vbeta/captchaControlChallengeCode/VerifyChallenge?tx=...` | Submit captcha text |
+| 8 | POST | `/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl/SendCode?tx=...` | Send OTP code to email |
+| 9 | POST | `/SelfAsserted/DisplayControlAction/vbeta/emailVerificationControl/VerifyCode?tx=...` | Verify OTP code |
+| 10 | POST | `/SelfAsserted?tx=...&p=B2C_1_new_login` | Submit full signup form |
+| 11 | GET | `/api/SelfAsserted/confirmed?csrf_token=...` | Confirm -> 302 redirect to `/api/auth?state=...&client_info=...` |
+| 12 | GET | `/api/auth?state=...&client_info=...` | Exchange auth code -> 307 redirect to home (sets session) |
+
+## Flow Diagram
+
+```
+Browser                      Genspark API              Azure AD B2C
+  |                              |                         |
+  |-- GET /api/login ----------->|                         |
+  |                              |-- 307 Location: ------->|
+  |                              |   authorize endpoint    |
+  |<------------------------------------------------------|
+  |                              
+  |-- GET /authorize?client_id=...&response_type=code... ->|
+  |                                                         |
+  |<-- login page HTML (with idp buttons) -----------------|
+  |
+  |-- GET /api/CombinedSigninAndSignup/unified ----------->|
+  |   ?local=signup&csrf_token=...                         |
+  |<-- signup page HTML (with window.SETTINGS) ------------|
+  |
+  |-- GET /api/auth/signup_template ---------------------->|
+  |<-- signup details HTML ---------------------------------|
+  |                                                         |
+  |-- GET GetChallenge?tx=... ---------------------------->|
+  |<-- {challengeId, challengeString(base64 JPEG)} --------|
+  |
+  |-- POST VerifyChallenge?tx=... ------------------------>|
+  |   body: challengeId, captchaEntered, challengeType     |
+  |<-- {status:"200", isCaptchaSolved:"True"} -------------|
+  |
+  |-- POST emailVerificationControl/SendCode?tx=... ------>|
+  |   body: email                                          |
+  |<-- {status:"200"} --------------------------------------|
+  |
+  |-- POST emailVerificationControl/VerifyCode?tx=... ---->|
+  |   body: email, emailVerificationCode                   |
+  |<-- {status:"200"} --------------------------------------|
+  |
+  |-- POST /SelfAsserted?tx=...&p=B2C_1_new_login ------->|
+  |   body: email, verificationCode, captcha,              |
+  |         newPassword, reenterPassword, request_type     |
+  |<-- {status:"200"} --------------------------------------|
+  |
+  |-- GET /api/SelfAsserted/confirmed?csrf_token=... ----->|
+  |<-- 302 Location: /api/auth?state=...&client_info=... --|
+  |
+  |-- GET /api/auth?state=...&client_info=... ------------>|
+  |<-- 307 Location: / (session cookie set) ---------------|
+  |                                                         |
+  |-- GET /api/user -------------------------------------->|
+  |<-- {user data} -----------------------------------------|
+```
+
+## Key Parameters
+
+### client_id
+`536a4e98-fd24-4cbc-a67b-417e209e0080`
+
+### authorize params
+- `response_type=code`
+- `redirect_uri=https://www.genspark.ai/api/auth`
+- `scope=email offline_access openid profile`
+- `code_challenge_method=S256` (PKCE)
+- `prompt=login`
+
+### CSRF Token
+Embedded in signup page HTML as `window.SETTINGS.csrf`. Same token used for all subsequent AJAX calls. Sent as `X-CSRF-TOKEN` header.
+
+### tx (Transaction ID / StateProperties)
+Base64-encoded JSON containing `TID` (UUID). Example:
+`StateProperties=eyJUSUQiOiJiYTFjNDA4OC00OTJm...`
+decodes to: `{"TID":"ba1c4088-492f-462c-b8da-c5077c89a2ff"}`
+
+### Request Headers
+- `X-CSRF-TOKEN: <csrf from page>`
+- `X-Requested-With: XMLHttpRequest`
+- `Content-Type: application/x-www-form-urlencoded; charset=UTF-8`
+- `Referer: https://login.genspark.ai/.../unified?...`
+
+### Captcha
+- Type: Visual (text-based, 4 chars)
+- Image: base64 JPEG in `challengeString`
+- Challenge ID: UUID
+
+### Password
+Observed: `Masuk@123456` (hardcoded in signup)
+
+## Session Flow
+
+### Signup Form Submission (step 10)
+```
+email=user%40email.com
+emailVerificationCode=<OTP from email>
+captchaControlChallengeCode=<captcha text>
+newPassword=<password>
+reenterPassword=<password>
+request_type=RESPONSE
+```
+
+### Confirmation -> Auth -> Session
+1. `/SelfAsserted/confirmed` returns 302 with Location pointing to `/api/auth`
+2. `/api/auth` returns 307 redirect to home page
+3. Subsequent requests include session cookie (set by B2C)
+4. `/api/user` returns user data with `email`, `plan`, etc.
+
+## Cookie Handling
+B2C sets various cookies during the flow. Must maintain session via cookie jar.
+
+## OTP Email
+After step 8 (SendCode), OTP is sent to the provided email. Must read email inbox to extract the code. OTP format: 6-digit numeric code.
+
+## Payment Flow (Stripe)
+
+### Tier Config
+`GET /api/payment/sub2/tier_config` returns 13 tiers. Default `plus1`:
+```
+price_id: price_1T7YeoHy7UpDvrVidVyuxxNm
+price_name: ai.genspark.vip.plus.c1.month
+plan_price: 24.99
+```
+
+### Create Checkout Session
+`POST /api/payment/create-checkout-session-web` (JSON):
+```json
+{
+  "price_id": "price_1T7YeoHy7UpDvrVidVyuxxNm",
+  "price_name": "ai.genspark.vip.plus.c1.month",
+  "plan_price": "24.99",
+  "plan_type": "subscription",
+  "testmode": "false",
+  "sandmode": "false",
+  "current_path": "/",
+  "checkout_source": "sub2",
+  "fromurl": "first_month_banner",
+  "wallet_coupon_key": "first_month:<cogen_id>",
+  "wallet_coupon_explicit": true
+}
+```
+Response: `data.url` = `https://checkout.stripe.com/c/pay/cs_live_...`
+
+### Coupon
+`wallet_coupon_key: first_month:<cogen_id>` -> first month $0 (HAR shows `amount_in_cents: 0`).
+
+### Checkout Status Poll
+`GET /api/payment/checkout-session?checkout_session_id=cs_live_...`
+Response: `{"payment_status":"paid","quantity":1,"amount_in_cents":0,"currency":"usd"}`
+
+### API Key
+`POST /api/api_tokens/create` (JSON `{"key_name":"..."}`)
+Response: `data.token` = `gsk-...` (JWT-encoded cogen_id + key_id)
+
+## accounts.json
+Saved per email: `email`, `cogen_id`, `api_key`, `key_name`, `payment_status`, `plan`, `created_at`.
+
+## Captcha Solver
+
+Captcha B2C = gambar JPEG base64, 4-8 karakter alfanumerik → endpoint **normal captcha / ImageToTextTask** (bukan reCAPTCHA).
+
+### Provider didukung (`solvers.py`)
+| Provider | API | Host |
+|---|---|---|
+| `2captcha` | in.php/res.php | https://2captcha.com |
+| `rucaptcha` | in.php/res.php | https://rucaptcha.com |
+| `azcaptcha` | in.php/res.php | https://azcaptcha.com |
+| `capsolver` | createTask | https://api.capsolver.com |
+| `anticaptcha` | createTask | https://api.anti-captcha.com |
+| `capmonster` | createTask | https://api.capmonster.cloud |
+| `manual` | — | input ketik sendiri (default) |
+
+### Pakai
+```bat
+set CAPTCHA_PROVIDER=2captcha
+set CAPTCHA_KEY=xxxxxxxxxxxxx
+py signup.py
+```
+Atau edit `CAPTCHA_PROVIDER` / `CAPTCHA_KEY` di atas `signup.py`.
+
+Solver salah baca → ambil captcha baru, ulangi sampai `CAPTCHA_TRIES` (default 3).
+
+## Multi-Akun Paralel
+
+`WORKERS = 6` (atas `signup.py`). Tiga fase:
+
+| Fase | Isi | Mode |
+|---|---|---|
+| 1 | login akun existing | paralel |
+| 2 | signup: captcha + OTP | serial (OTP butuh baca email) |
+| 3 | checkout Stripe + API key | paralel |
+
+Tiap `Client` punya cookie jar sendiri → sesi antar akun tak tercampur. `accounts.json` + stdout dilindungi `IO_LOCK`.
+
+Email yang sudah ada di `accounts.json` dilewati → run ulang aman untuk melanjutkan yang gagal.
+
+## Sumber Email (Emailnator)
+
+Dari HAR `www.emailnator.com.har`. Host `https://www.emailnator.com`.
+
+| Method | Endpoint | Body | Response |
+|---|---|---|---|
+| GET | `/` | — | set cookie `XSRF-TOKEN` + `gmailnator_session` |
+| POST | `/generate-email` | `{"email":["dotGmail"]}` | `{"email":["x@gmail.com"]}` |
+| POST | `/message-list` | `{"email":"x@gmail.com"}` | `{"messageData":[{messageID,from,subject,time}]}` |
+| POST | `/message-list` | `{"email":"...","messageID":"..."}` | isi email (HTML mentah) |
+| POST | `/delete-message` | `{"email":"...","messageID":"..."}` | `{"status":"success"}` |
+
+### Header wajib
+- `X-XSRF-TOKEN: <cookie XSRF-TOKEN, URL-decoded>`
+- `X-Requested-With: XMLHttpRequest`
+- `Content-Type: application/json`
+- `Origin` / `Referer`: `https://www.emailnator.com`
+
+Token = Laravel encrypted cookie (`eyJpdiI6...`). Ambil dari cookie jar setelah `GET /`, URL-decode, kirim sebagai header.
+
+### Jenis alamat
+`dotGmail` (default — titik acak, inbox Gmail asli) | `plusGmail` | `googleMail` | `domain`
+
+`messageID: "ADSVPN"` = iklan bawaan emailnator, difilter di `mailer.py`.
+
+### Pakai
+```bat
+set EMAIL_SOURCE=emailnator
+set EMAIL_COUNT=3
+set CAPTCHA_PROVIDER=capsolver
+set CAPTCHA_KEY=xxxxx
+py signup.py
+```
+Alamat baru dicatat ke `akun.txt`. Dengan `EMAIL_SOURCE=emailnator` + solver aktif, fase 2 (signup) jalan **paralel** — captcha dan OTP dua-duanya otomatis.
+
+`EMAIL_SOURCE=file` (default): baca `akun.txt`, OTP diketik manual.
+
+## Catatan: transaksi B2C sekali pakai
+
+Percobaan **login yang gagal** meninggalkan transaksi B2C (`tx` / StateProperties) dalam keadaan rusak. Kalau `tx` itu dipakai untuk signup, `SendCode` balas:
+
+```
+HTTP 500 - The page cannot be displayed because an internal server error has occurred.
+```
+
+Jadi setiap jalur signup **wajib** buka sesi baru (`Client()` + `start()` + `open_signup()`), bukan melanjutkan sesi yang sudah dipakai untuk login. Dijaga oleh `test_fresh_client_for_signup()`.
+
+Error lain yang sudah dipetakan:
+
+| Error | Arti | Penanganan |
+|---|---|---|
+| `NoChallengeSession` | challenge captcha expired | ambil captcha baru, ulangi |
+| `WrongAnswer` (`isCaptchaSolved: False`) | captcha salah baca | ambil captcha baru, ulangi |
+| `ViralErrorUserCreationConflict` | email sudah terdaftar | login dulu; kalau login juga gagal berarti password beda -> tukar alamat (emailnator) |
+| `HTTP 500` di `SendCode` | `tx` bekas login gagal | sesi baru |
+| `HTTP 403` di `/api/*` | `User-Agent` tak dikirim | selalu kirim UA |
+| `HTTP 500` di `checkout-session` | session belum siap di backend | poll ulang, cek `plan` juga |
+
+## Konfigurasi lewat .env
+
+```bat
+copy .env.example .env
+```
+
+Lalu isi `.env`:
+
+```ini
+CAPTCHA_PROVIDER=2captcha
+CAPTCHA_KEY=api-key-2captcha-kamu
+EMAIL_SOURCE=emailnator
+EMAIL_COUNT=3
+```
+
+| Key | Default | Isi |
+|---|---|---|
+| `CAPTCHA_PROVIDER` | `manual` | `2captcha`, `capsolver`, `anticaptcha`, `capmonster`, `rucaptcha`, `azcaptcha` |
+| `CAPTCHA_KEY` | — | API key provider |
+| `CAPTCHA_TRIES` | `3` | ulang kalau solver salah baca |
+| `EMAIL_SOURCE` | `file` | `file` (akun.txt) / `emailnator` (otomatis) |
+| `EMAIL_COUNT` | `1` | jumlah akun kalau `emailnator` |
+| `OTP_TIMEOUT` | `300` | detik menunggu OTP |
+| `WORKERS` | `6` | worker paralel |
+| `PASSWORD` | `Masuk@123456` | password semua akun |
+
+Env var proses menimpa `.env`, jadi `set EMAIL_COUNT=5` tetap berlaku untuk sekali jalan.
+
+`.env` masuk `.gitignore` bareng `accounts.json` dan `akun.txt` — semuanya berisi rahasia.
+
+Saat start, saldo provider dicek dulu. Key salah/kosong -> berhenti sebelum boros captcha:
+
+```
+captcha: 2captcha (saldo 3.45)              <- siap
+captcha: 2captcha - key ditolak: ERROR_WRONG_USER_KEY
+captcha: 2captcha - CAPTCHA_KEY KOSONG, isi di .env dulu
+```
+
+Cek manual tanpa jalankan signup:
+```bat
+py solvers.py 2captcha api-key-kamu
+```
+
+## Alamat emailnator itu publik
+
+`dotGmail` = Gmail asli dengan titik acak, inbox-nya terbuka di emailnator. Bisa saja alamat yang kamu dapat **sudah dipakai orang lain** dengan password berbeda. Akibatnya:
+
+1. Fase 1 login gagal (password bukan `PASSWORD`)
+2. Fase 2 signup kena `ViralErrorUserCreationConflict`
+
+Penanganan:
+
+- `EMAIL_SOURCE=emailnator` -> ambil alamat baru, ulangi sampai `EMAIL_TRIES` (default 3). Alamat memang sekali pakai, jadi menukar itu benar. Alamat pengganti dicatat ke `akun.txt`, dan `accounts.json` menyimpan alamat yang benar-benar dipakai.
+- `EMAIL_SOURCE=file` -> **tidak** ditukar (alamat itu milikmu). Pesannya:
+  ```
+  x@gmail.com sudah terdaftar tapi password bukan 'Masuk@123456'.
+  Set PASSWORD di .env sesuai akun itu, atau pakai email lain.
+  ```
+
+Tambahan `.env`: `EMAIL_TRIES=3`.
+
+Untuk akun yang mau dipakai lama, jangan pakai emailnator - orang lain bisa baca OTP-nya dan reset password.
+
+## Proxy
+
+Isi `PROXY` di `.env` (pisah koma) dan/atau `proxy.txt` (satu per baris). Keduanya digabung, duplikat dibuang.
+
+```ini
+PROXY=http://user:pass@1.2.3.4:8080, socks5://5.6.7.8:1080
+```
+
+Tipe yang didukung:
+
+| Skema | Catatan |
+|---|---|
+| `http` / `https` | stdlib `ProxyHandler` |
+| `socks4` / `socks4a` | butuh PySocks |
+| `socks5` / `socks5h` | butuh PySocks; akhiran `h`/`a` = DNS diresolve di proxy |
+
+Format baris yang diterima:
+
+```
+http://user:pass@1.2.3.4:8080
+socks5h://1.2.3.4:1080
+1.2.3.4:8080                  <- tanpa skema = http
+1.2.3.4:8080:user:pass        <- host:port:user:pass
+```
+
+Komentar (`#`) boleh di awal baris atau di ujung baris.
+
+### Round-robin
+
+`proxies.Pool` bergilir dan thread-safe (`itertools.cycle` sendirinya tidak, jadi dikunci).
+
+**Satu akun = satu proxy, konsisten sepanjang alurnya** — `Client`, inbox Emailnator, dan alamat pengganti saat conflict semuanya pakai IP yang sama. Alasannya: B2C mengikat transaksi ke IP; ganti IP di tengah alur bikin transaksi ditolak.
+
+Pool kosong -> koneksi langsung. IP yang dipakai tercatat di `accounts.json` (field `proxy`).
+
+Install PySocks kalau pakai SOCKS:
+```bat
+pip install PySocks
+```
+
+## Cek sisa credit
+
+```bat
+py signup.py credit
+```
+
+Login paralel ke semua akun di `accounts.json`, cetak plan + credit + masa aktif, lalu perbarui `accounts.json`:
+
+```
+  c.o.n.toh.akun1@gmail.com
+        plan=plus credit=9716 status=active sampai=2026-09-28T10:39:30
+
+total credit: 29627
+```
+
+Endpoint: `GET /api/payment/get_credit_balance` -> `{"data":{"balance":10120}}`
+
+Credit juga ikut disimpan otomatis setiap kali akun selesai diproses.
+
+## Kenapa Stripe kadang tak minta kartu
+
+Kalau kartu sudah tersimpan di akun Stripe (`stripeAccountEmail` terisi) dan coupon `first_month:<cogen_id>` bikin tagihan $0, checkout selesai tanpa form. `wait_paid()` sudah menangani ini: selain memantau `payment_status`, ia juga memeriksa `plan != free`, karena webhook Stripe kadang menaikkan plan lebih dulu daripada endpoint `checkout-session` melaporkan `paid`.
+
+Verifikasi manual:
+```bat
+py signup.py credit
+```
+`plan=plus` + `status=active` = pembayaran benar-benar masuk.

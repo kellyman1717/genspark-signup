@@ -1,0 +1,6 @@
+.env
+accounts.json
+akun.txt
+proxy.txt
+captcha*.png
+__pycache__/
