@@ -2,7 +2,7 @@
 """Genspark.ai auto-signup per email from akun.txt (Azure AD B2C flow)."""
 import json, re, sys, time, urllib.parse, urllib.request, urllib.error, base64, os, webbrowser
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mailer
 import proxies
@@ -33,7 +33,8 @@ def load_env(path=ENV_FILE):
     cfg.update({k: v for k, v in os.environ.items() if k in cfg or k in (
         "CAPTCHA_PROVIDER", "CAPTCHA_KEY", "CAPTCHA_TRIES",
         "EMAIL_SOURCE", "EMAIL_COUNT", "EMAIL_TRIES", "OTP_TIMEOUT",
-        "PROXY", "PROXY_TRIES", "TIMEOUT", "WORKERS", "PASSWORD")})
+        "PROXY", "PROXY_TRIES", "TIMEOUT", "MAIL_TIMEOUT", "WORKERS",
+        "TAB_DELAY", "PASSWORD")})
     return cfg
 
 
@@ -58,11 +59,18 @@ PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.txt
 PROXY_POOL = proxies.Pool(proxies.load(ENV.get("PROXY", ""), PROXY_FILE))
 # proxy publik banyak yang mati; coba proxy lain sebanyak ini kalau koneksi gagal
 PROXY_TRIES = int(ENV.get("PROXY_TRIES", "4"))
-# Timeout per request. Dibuat pendek supaya proxy mati cepat ketahuan:
+# Timeout request ke Genspark. Pendek supaya proxy mati cepat ketahuan:
 # menunggu 30s untuk proxy yang tak akan menjawab cuma memboroskan waktu.
 TIMEOUT = int(ENV.get("TIMEOUT", "5" if len(PROXY_POOL) else "30"))
+# Emailnator jauh lebih lambat: message-list pada inbox berisi butuh 5-6s
+# (terukur), jadi TIMEOUT pendek bikin pembacaan inbox gagal terus.
+# Dipisah, dan tak pernah lebih pendek dari 20s.
+MAIL_TIMEOUT = max(int(ENV.get("MAIL_TIMEOUT", "30")), 20)
 PASSWORD = ENV.get("PASSWORD", "Masuk@123456")  # password semua akun
-IO_LOCK = threading.Lock()  # accounts.json + stdout
+IO_LOCK = threading.Lock()   # accounts.json + stdout
+TAB_LOCK = threading.Lock()  # buka tab Stripe satu-satu
+# detik jeda antar tab checkout; kartu diisi manusia, jangan diserbu
+TAB_DELAY = float(ENV.get("TAB_DELAY", "3"))
 
 # Tier dari HAR /api/payment/sub2/tier_config. Ganti TIER_ID untuk paket lain.
 TIER_ID = "plus1"
@@ -71,6 +79,41 @@ TIER = {
     "price_name": "ai.genspark.vip.plus.c1.month",
     "plan_price": "24.99",
 }
+
+
+def gmail_key(email):
+    """Kunci inbox Gmail: titik diabaikan Gmail, jadi a.b@gmail dan ab@gmail
+    adalah inbox yang SAMA -- dan akun Genspark yang sama."""
+    user, _, dom = email.partition("@")
+    return user.replace(".", "").lower() + "@" + dom.lower()
+
+
+def fresh_email(mail, avoid=(), tries=6):
+    """Alamat emailnator yang inbox-nya belum pernah dipakai.
+
+    Emailnator mengacak titik pada nama yang sama, jadi ia bisa memberi
+    "x.z.e.r.afro.st@" padahal "x.ze.r.a.fro.s.t@" sudah punya akun -- Gmail
+    mengabaikan titik, jadi keduanya satu inbox dan signup kena conflict.
+    """
+    for _ in range(tries):
+        em = mail.new_email()
+        if gmail_key(em) not in avoid:
+            return em
+    return em      # sudah usaha; biarkan alur conflict yang menangani
+
+
+def used_inboxes():
+    """Kunci inbox yang sudah terpakai: dari accounts.json dan akun.txt."""
+    keys = set()
+    for em in load_accounts():
+        keys.add(gmail_key(em))
+    if os.path.exists(PWD_SRC):
+        with open(PWD_SRC, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    keys.add(gmail_key(line.split(":")[0]))
+    return keys
 
 
 def record_emails(fresh):
@@ -92,8 +135,13 @@ def record_emails(fresh):
 def get_emails():
     """EMAIL_SOURCE=file -> baca akun.txt. =emailnator -> bikin alamat baru."""
     if EMAIL_SOURCE.lower() == "emailnator":
-        m = mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT)
-        fresh = [m.new_email() for _ in range(EMAIL_COUNT)]
+        m = mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=MAIL_TIMEOUT)
+        avoid = used_inboxes()
+        fresh = []
+        for _ in range(EMAIL_COUNT):
+            em = fresh_email(m, avoid)
+            avoid.add(gmail_key(em))     # jangan tabrakan di dalam batch ini juga
+            fresh.append(em)
         record_emails(fresh)
         return fresh
     emails = []
@@ -307,16 +355,25 @@ class Client:
                 return {}  # belum selesai / belum ada di backend
             raise
 
-    def wait_paid(self, session_id, timeout=900, interval=5):
+    def wait_paid(self, session_id, timeout=900, interval=5, email=""):
         """Poll sampai paid. Fallback: cek plan user (webhook kadang lebih dulu)."""
         deadline = time.time() + timeout
+        started = time.time()
+        beat = started + 60          # kabari tiap menit: ini menunggu manusia
         while time.time() < deadline:
             st = self.checkout_status(session_id)
             if st.get("payment_status") == "paid":
                 return st
-            plan = self.get_user()["data"]["cogen"].get("plan")
+            try:
+                plan = self.get_user()["data"]["cogen"].get("plan")
+            except Exception:
+                plan = None          # jaringan goyah bukan alasan berhenti
             if plan and plan != "free":
                 return {"payment_status": "paid", "plan": plan}
+            if time.time() >= beat:
+                beat = time.time() + 60
+                log(f"  [{email}] masih nunggu kartu diisi "
+                    f"({int(time.time() - started)}s dari {int(timeout)}s)")
             time.sleep(interval)
         raise RuntimeError(f"timeout {timeout}s nunggu pembayaran")
 
@@ -446,7 +503,7 @@ def get_otp(email, proxy=None):
             raise RuntimeError("otp kosong")
         return otp
     log(f"  [{email}] nunggu OTP di inbox...")
-    return mailer.wait_otp(mailer.Emailnator(proxy=proxy, timeout=TIMEOUT), email, sender="genspark",
+    return mailer.wait_otp(mailer.Emailnator(proxy=proxy, timeout=MAIL_TIMEOUT), email, sender="genspark",
                            timeout=OTP_TIMEOUT, log=log)
 
 
@@ -495,7 +552,9 @@ def interactive_signup(email, tries=EMAIL_TRIES):
                     f"{email} sudah terdaftar tapi password bukan '{PASSWORD}'. "
                     "Set PASSWORD di .env sesuai akun itu, atau pakai email lain."
                 ) from None
-            baru = mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT).new_email()
+            baru = fresh_email(
+                mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=MAIL_TIMEOUT),
+                used_inboxes())
             log(f"  [{email}] sudah dipakai -> tukar ke {baru}")
             record_emails([baru])
             email = baru
@@ -512,9 +571,13 @@ def phase_finish(email, c, cogen, accounts):
                                 TIER["plan_price"], "subscription",
                                 coupon_key=f"first_month:{cogen_id}")
         session_id = re.search(r"cs_live_[A-Za-z0-9]+", url).group(0)
-        log(f"  [{email}] BUKA & ISI KARTU: {url}")
-        webbrowser.open(url)
-        st = c.wait_paid(session_id)  # poll paralel, tak blokir akun lain
+        # Kartu diisi manusia satu per satu: membuka lima tab serentak justru
+        # menyulitkan. Tab dibuka berjarak, polling tetap jalan paralel.
+        with TAB_LOCK:
+            log(f"  [{email}] BUKA & ISI KARTU: {url}")
+            webbrowser.open(url)
+            time.sleep(TAB_DELAY)
+        st = c.wait_paid(session_id, email=email)  # poll paralel
         log(f"  [{email}] payment: {st.get('payment_status')}")
 
     key_name = f"gk-{int(time.time() * 1000)}"
@@ -559,6 +622,7 @@ def main():
           f"ganti sampai {PROXY_TRIES}x)"
           if len(PROXY_POOL) else
           f"proxy  : tak dipakai (koneksi langsung, timeout {TIMEOUT}s)")
+    print(f"         inbox timeout {MAIL_TIMEOUT}s")
     print(f"email  : {EMAIL_SOURCE.lower()}"
           + (" (OTP otomatis)" if EMAIL_SOURCE.lower() == "emailnator"
              else " (OTP diketik manual)"))
@@ -570,7 +634,12 @@ def main():
     print(f"== fase 1: login paralel ({WORKERS} worker) ==")
     ready, needs_human, failed = [], [], {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for email, fut in [(e, pool.submit(phase_auth, e)) for e in todo]:
+        # as_completed: akun yang selesai dulu dilaporkan dulu. Kalau hasil
+        # dipanen berurutan submit, satu akun lambat menahan laporan akun lain
+        # yang sudah kelar -- kelihatan seperti macet padahal jalan.
+        futs = {pool.submit(phase_auth, e): e for e in todo}
+        for fut in as_completed(futs):
+            email = futs[fut]
             try:
                 c, cogen, how = fut.result()
                 log(f"  [{email}] {how} OK (plan={cogen.get('plan')})")
@@ -592,8 +661,9 @@ def main():
               f"({len(needs_human)} akun) ==")
         if auto:
             with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                for email, fut in [(e, pool.submit(interactive_signup, e))
-                                   for e in needs_human]:
+                futs = {pool.submit(interactive_signup, e): e for e in needs_human}
+                for fut in as_completed(futs):
+                    email = futs[fut]
                     try:
                         used, c, cogen = fut.result()
                         ready.append((used, c, cogen))
@@ -617,8 +687,10 @@ def main():
         print()
         print(f"== fase 3: checkout + api key paralel ({len(ready)} akun) ==")
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            for email, fut in [(e, pool.submit(phase_finish, e, c, g, accounts))
-                               for e, c, g in ready]:
+            futs = {pool.submit(phase_finish, e, c, g, accounts): e
+                    for e, c, g in ready}
+            for fut in as_completed(futs):
+                email = futs[fut]
                 try:
                     fut.result()
                 except Exception as ex:
@@ -660,7 +732,8 @@ def check_credits():
     print()
     rows, total = [], 0
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for fut in [pool.submit(one, e, r) for e, r in accounts.items()]:
+        for fut in as_completed([pool.submit(one, e, r)
+                                 for e, r in accounts.items()]):
             try:
                 email, info, err = fut.result()
             except Exception as ex:

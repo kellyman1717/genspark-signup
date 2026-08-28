@@ -441,3 +441,80 @@ Alasannya proxy busuk punya dua cara gagal, dan yang kedua mahal:
 Dengan timeout 30s, empat percobaan proxy diam = 2 menit terbuang per akun. Dengan 5s = 20 detik. Terukur: proxy yang listen tapi tak menjawab gagal tepat pada batas timeout.
 
 Naikkan kalau proxy kamu lambat tapi sehat (`TIMEOUT=10`); turunkan kalau daftar proxy banyak sampahnya (`TIMEOUT=3`).
+
+`TIMEOUT` **hanya** berlaku untuk request ke Genspark. Emailnator punya `MAIL_TIMEOUT` sendiri (default 30s, minimum 20s), karena jauh lebih lambat -- terukur:
+
+| Endpoint | Waktu |
+|---|---|
+| `GET /` (bootstrap) | 0.1s |
+| `generate-email` | 0.3s |
+| `message-list` (inbox kosong) | ~1s |
+| `message-list` (inbox berisi) | **5-6s** |
+
+Dulu keduanya memakai satu nilai, jadi `TIMEOUT=5` demi proxy ikut memutus pembacaan inbox: pada inbox berisi hanya **1 dari 6** percobaan berhasil. Setelah dipisah: **6 dari 6**.
+
+## Alamat Emailnator bisa satu inbox
+
+Gmail mengabaikan titik: `a.b@gmail.com` dan `ab@gmail.com` adalah inbox yang **sama**, dan karena Genspark memakai email sebagai identitas, keduanya juga akun yang sama.
+
+Emailnator mengacak posisi titik pada nama yang sama, jadi ia bisa memberi `x.z.e.r.afro.s.t@gmail.com` padahal `x.ze.r.a.fro.s.t@gmail.com` sudah punya akun. Hasilnya `ViralErrorUserCreationConflict` yang membingungkan -- alamatnya kelihatan baru, tapi inbox-nya bukan.
+
+`gmail_key()` menormalkan alamat (buang titik, huruf kecil), lalu `used_inboxes()` mengumpulkan kunci dari `accounts.json` **dan** `akun.txt`. `fresh_email()` meminta alamat baru sampai inbox-nya belum terpakai (maksimal 6 kali), termasuk mencegah tabrakan di dalam satu batch. Kalau tetap tabrakan, alur tukar-alamat yang menangani.
+
+Cek duplikat di daftar sendiri:
+
+```bat
+py -c "import signup,collections;d=collections.Counter(signup.gmail_key(e) for e in open('akun.txt',encoding='utf-8') if e.strip() and not e.startswith('#'));print([k for k,v in d.items() if v>1])"
+```
+
+## Log inbox error diringkas
+
+Membaca inbox Emailnator memang kadang gagal (`The read operation timed out`), dan itu ditelan lalu dicoba lagi -- bukan kegagalan akun. Tapi tiap kegagalan dulu dicetak satu baris, jadi satu inbox lambat bisa membanjiri layar puluhan baris identik dan menutupi keterangan akun lain yang jalan bersamaan.
+
+Sekarang tiap jenis error dilaporkan **sekali** per akun, dan barisnya diberi nama akun supaya jelas milik siapa saat berjalan paralel. Jumlah kegagalan disebut di pesan timeout kalau OTP memang tak pernah datang:
+
+```
+[x@gmail.com] inbox: The read operation timed out (dicoba ulang, diam-diam)
+[x@gmail.com] OTP 424242 dari Microsoft on behalf of Genspark
+```
+
+Terukur: 7 kegagalan berurutan menghasilkan 2 baris log, bukan 8.
+
+## Kelihatan macet padahal jalan
+
+Gejalanya: dua akun sudah dapat OTP, lalu tak ada keluaran apa pun.
+
+Penyebabnya cara memanen hasil. Pola lama memanen berurutan submit:
+
+```python
+for email, fut in [(e, pool.submit(kerja, e)) for e in daftar]:
+    fut.result()          # menunggu akun PERTAMA, walau yang lain sudah kelar
+```
+
+Terukur, empat pekerjaan (akun pertama 3s, sisanya 0.1s):
+
+| Pola | Laporan pertama |
+|---|---|
+| berurutan submit | 3.0s (semua sekaligus di akhir) |
+| `as_completed` | 0.1s |
+
+Jadi akun yang sudah selesai tetap diam sampai akun terlambat kelar. Sekarang keempat fase memakai `as_completed`.
+
+Ditambah tanda hidup, karena menunggu OTP dan menunggu kartu memang lama:
+
+```
+[x@gmail.com] masih nunggu OTP (30s dari 300s, 2 gagal baca)
+[x@gmail.com] masih nunggu kartu diisi (60s dari 900s)
+```
+
+### Gagal baca body tak lagi mematikan akun
+
+`wait_otp` dulu memanggil `mail.body()` tanpa pelindung, padahal Emailnator sering timeout. Sekali gagal, akun itu langsung mati meski percobaan berikutnya akan berhasil. Selain itu pesan langsung ditandai sudah-dibaca sebelum isinya diperiksa, jadi email OTP yang belum lengkap saat diambil tak pernah dicek lagi.
+
+Sekarang: `body()` dibungkus, dan hanya pesan yang **jelas bukan** dari pengirim yang dicari yang ditandai lewati. Pesan dari pengirim yang benar dicoba ulang sampai OTP-nya terbaca.
+
+### Tab Stripe dibuka berjarak
+
+Lima akun berarti lima tab checkout. Karena kartu diisi manusia satu per satu, tab dibuka berjarak `TAB_DELAY` detik (default 3) sambil polling tetap paralel.
+
+Tambahan `.env`: `TAB_DELAY=3`.

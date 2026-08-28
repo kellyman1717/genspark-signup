@@ -21,6 +21,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Jenis alamat: dotGmail (titik acak, inbox Gmail asli) | plusGmail | googleMail | domain
 KIND = "dotGmail"
 ADS = {"ADSVPN"}  # messageID iklan bawaan emailnator, bukan email nyata
+HEARTBEAT = 30    # detik: seberapa sering kabari kalau OTP belum datang
 
 
 class Emailnator:
@@ -94,30 +95,63 @@ def extract_otp(text, digits=6):
     return hits[0] if hits else None
 
 
+def _warn(log, warned, email, ex):
+    """Laporkan satu jenis error sekali saja per akun: emailnator sering gagal
+    dan mencetak tiap kegagalan akan menutupi keterangan akun lain."""
+    key = type(ex).__name__ + str(ex)[:40]
+    if key not in warned:
+        warned.add(key)
+        log(f"    [{email}] inbox: {ex} (dicoba ulang, diam-diam)")
+
+
 def wait_otp(mail, email, sender=None, timeout=180, interval=5, digits=6, log=print):
-    """Poll inbox sampai OTP ketemu. sender = filter substring pada from/subject."""
+    """Poll inbox sampai OTP ketemu. sender = filter substring pada from/subject.
+
+    Kegagalan baca inbox itu wajar (emailnator lambat dan kadang menolak), jadi
+    ditelan lalu dicoba lagi. Tapi hanya dilaporkan sekali per jenis error:
+    tanpa itu satu inbox lambat bisa membanjiri log puluhan baris identik dan
+    menutupi keterangan akun lain yang jalan bersamaan.
+    """
     deadline = time.time() + timeout
-    seen = set()
+    skip, warned = set(), set()      # skip = pesan yang jelas bukan OTP
+    errors = 0
+    started = time.time()
+    beat = started + HEARTBEAT       # kabari kalau lama, biar tak tampak macet
     while time.time() < deadline:
+        if time.time() >= beat:
+            beat = time.time() + HEARTBEAT
+            log(f"    [{email}] masih nunggu OTP "
+                f"({int(time.time() - started)}s dari {int(timeout)}s"
+                + (f", {errors} gagal baca" if errors else "") + ")")
         try:
             msgs = mail.messages(email)
         except Exception as ex:
-            log(f"    inbox error: {ex}")
+            errors += 1
+            _warn(log, warned, email, ex)
             msgs = []
         for m in msgs:
             mid = m.get("messageID")
-            if mid in seen:
+            if mid in skip:
                 continue
-            seen.add(mid)
             blob = f"{m.get('from','')} {m.get('subject','')}"
             if sender and sender.lower() not in blob.lower():
+                skip.add(mid)        # bukan dari pengirim yang dicari, abaikan
                 continue
-            code = extract_otp(mail.body(email, mid), digits)
+            # body() bisa gagal atau isinya belum lengkap; JANGAN tandai skip,
+            # supaya pesan yang benar dicoba lagi pada putaran berikutnya.
+            try:
+                body = mail.body(email, mid)
+            except Exception as ex:
+                errors += 1
+                _warn(log, warned, email, ex)
+                continue
+            code = extract_otp(body, digits)
             if code:
-                log(f"    OTP {code} dari: {m.get('from','?')[:50]}")
+                log(f"    [{email}] OTP {code} dari {m.get('from','?')[:40]}")
                 return code
         time.sleep(interval)
-    raise RuntimeError(f"OTP tak ketemu dalam {timeout}s")
+    raise RuntimeError(
+        f"OTP tak ketemu dalam {timeout}s ({errors} kegagalan baca inbox)")
 
 
 def demo():
@@ -131,7 +165,77 @@ def demo():
     assert extract_otp("Ref 111111 ... your verification code is 222222") == "222222"
     assert extract_otp("no digits here") is None
     assert "ADSVPN" in ADS
-    print("PASS: extract_otp OK")
+
+    # body() gagal sekali lalu berhasil -> tetap dapat OTP, jangan gagalkan akun
+    class Recovers:
+        def __init__(self):
+            self.n = 0
+
+        def messages(self, e):
+            return [{"messageID": "m1", "from": "Microsoft on behalf of Genspark"}]
+
+        def body(self, e, m):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("The read operation timed out")
+            return "code 424242"
+
+    r = Recovers()
+    assert wait_otp(r, "x@g.com", sender="genspark", timeout=5, interval=0,
+                    log=lambda *a: None) == "424242"
+    assert r.n == 2, r.n
+
+    # isi belum lengkap -> pesan dibaca ulang, bukan dibuang selamanya
+    class Slow:
+        def __init__(self):
+            self.n = 0
+
+        def messages(self, e):
+            return [{"messageID": "m1", "from": "Microsoft on behalf of Genspark"}]
+
+        def body(self, e, m):
+            self.n += 1
+            return "memuat..." if self.n == 1 else "code 999888"
+
+    assert wait_otp(Slow(), "x@g.com", sender="genspark", timeout=5, interval=0,
+                    log=lambda *a: None) == "999888"
+
+    # pesan yang tak cocok sender hanya diperiksa sekali, tak diunduh berulang
+    class Noise:
+        def __init__(self):
+            self.body_calls = 0
+
+        def messages(self, e):
+            return [{"messageID": "spam", "from": "SHEIN"}]
+
+        def body(self, e, m):
+            self.body_calls += 1
+            return "diskon"
+
+    n = Noise()
+    try:
+        wait_otp(n, "x@g.com", sender="genspark", timeout=0.3, interval=0.1,
+                 log=lambda *a: None)
+        raise AssertionError("harus timeout")
+    except RuntimeError:
+        pass
+    assert n.body_calls == 0, n.body_calls
+
+    # heartbeat: menunggu lama harus tetap mengabari, jangan diam total
+    global HEARTBEAT
+    orig, HEARTBEAT = HEARTBEAT, 0.1
+    try:
+        beats = []
+        try:
+            wait_otp(Noise(), "x@g.com", sender="genspark", timeout=0.5,
+                     interval=0.1, log=beats.append)
+            raise AssertionError("harus timeout")
+        except RuntimeError:
+            pass
+        assert any("masih nunggu OTP" in b for b in beats), beats
+    finally:
+        HEARTBEAT = orig
+    print("PASS: extract_otp + wait_otp tahan gagal baca body")
 
 
 if __name__ == "__main__":

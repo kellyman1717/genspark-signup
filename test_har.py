@@ -263,6 +263,206 @@ def test_timeout():
     print("PASS: timeout dipatuhi, proxy hang cepat dipotong")
 
 
+def test_mail_timeout_separate():
+    """Emailnator jauh lebih lambat dari Genspark: message-list pada inbox berisi
+    butuh 5-6s (terukur). TIMEOUT yang dipendekkan demi proxy tak boleh ikut
+    memutus pembacaan inbox, jadi MAIL_TIMEOUT dipisah dan punya batas bawah."""
+    import importlib, inspect, os as _os, signup
+
+    # TIMEOUT pendek tak boleh menular ke Emailnator
+    _os.environ["TIMEOUT"] = "5"
+    _os.environ.pop("MAIL_TIMEOUT", None)
+    importlib.reload(signup)
+    assert signup.TIMEOUT == 5
+    assert signup.MAIL_TIMEOUT >= 20, signup.MAIL_TIMEOUT
+
+    # batas bawah 20s: nilai yang terlalu kecil dinaikkan
+    _os.environ["MAIL_TIMEOUT"] = "3"
+    importlib.reload(signup)
+    assert signup.MAIL_TIMEOUT == 20, signup.MAIL_TIMEOUT
+
+    # nilai wajar dihormati
+    _os.environ["MAIL_TIMEOUT"] = "45"
+    importlib.reload(signup)
+    assert signup.MAIL_TIMEOUT == 45
+
+    # tiap pemakaian Emailnator harus lewat MAIL_TIMEOUT, bukan TIMEOUT
+    src = inspect.getsource(signup)
+    assert "Emailnator(proxy=proxy, timeout=TIMEOUT)" not in src
+    assert "Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT)" not in src
+    assert src.count("timeout=MAIL_TIMEOUT") == 3, src.count("timeout=MAIL_TIMEOUT")
+
+    for k in ("TIMEOUT", "MAIL_TIMEOUT"):
+        _os.environ.pop(k, None)
+    importlib.reload(signup)
+    print("PASS: MAIL_TIMEOUT terpisah dari TIMEOUT proxy")
+
+
+def test_wait_otp_stops():
+    """wait_otp harus BERHENTI begitu OTP ketemu, dan tak memeriksa ulang pesan
+    yang sudah dibaca."""
+    import mailer
+
+    class FakeMail:
+        def __init__(self):
+            self.list_calls = 0
+
+        def messages(self, email):
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise RuntimeError("The read operation timed out")   # error ditelan
+            return [{"messageID": "m1", "from": "Microsoft on behalf of Genspark"}]
+
+        def body(self, email, mid):
+            return "Your code is 424242"
+
+    m = FakeMail()
+    logs = []
+    code = mailer.wait_otp(m, "a@b.c", sender="genspark", timeout=30,
+                           interval=0, log=logs.append)
+    assert code == "424242", code
+    assert m.list_calls == 2, m.list_calls        # gagal sekali, lalu ketemu -> stop
+    assert any("inbox:" in x for x in logs)
+    assert any("424242" in x for x in logs)
+
+    # error yang sama berulang hanya dilaporkan SEKALI: tanpa ini satu inbox
+    # lambat membanjiri log dan menutupi keterangan akun lain
+    class Slow:
+        def __init__(self):
+            self.n = 0
+
+        def messages(self, email):
+            self.n += 1
+            if self.n < 8:
+                raise RuntimeError("The read operation timed out")
+            return [{"messageID": "m1", "from": "Microsoft on behalf of Genspark"}]
+
+        def body(self, email, mid):
+            return "code 424242"
+
+    logs = []
+    assert mailer.wait_otp(Slow(), "a@b.c", sender="genspark", timeout=30,
+                           interval=0, log=logs.append) == "424242"
+    assert len(logs) == 2, logs      # 1 peringatan + 1 OTP, bukan 8 baris
+
+    # pesan yang tak cocok sender tak dibaca ulang tiap putaran
+    class Noise:
+        def __init__(self):
+            self.body_calls = 0
+
+        def messages(self, email):
+            return [{"messageID": "spam", "from": "SHEIN"}]
+
+        def body(self, email, mid):
+            self.body_calls += 1
+            return "diskon 50%"
+
+    n = Noise()
+    try:
+        mailer.wait_otp(n, "a@b.c", sender="genspark", timeout=0.3,
+                        interval=0.1, log=lambda *a: None)
+        raise AssertionError("harus timeout kalau OTP tak pernah datang")
+    except RuntimeError as ex:
+        assert "tak ketemu" in str(ex)
+    assert n.body_calls == 0, "pesan yang difilter sender jangan diunduh"
+    print("PASS: wait_otp berhenti saat OTP ketemu, tak baca ulang")
+
+
+def test_gmail_dedupe():
+    """Gmail mengabaikan titik: a.b@gmail dan ab@gmail adalah SATU inbox, jadi
+    satu akun Genspark. Emailnator mengacak titik pada nama yang sama, jadi ia
+    bisa memberi alamat yang inbox-nya sudah punya akun -> conflict."""
+    import importlib, os as _os, tempfile, signup, mailer
+
+    assert signup.gmail_key("x.z.e.r.afro.s.t@gmail.com") == \
+        signup.gmail_key("x.ze.r.a.fro.s.t@gmail.com") == "xzerafrost@gmail.com"
+    assert signup.gmail_key("A.B@Gmail.COM") == "ab@gmail.com"
+
+    # fresh_email harus melewati alamat yang inbox-nya sudah dipakai
+    urut = iter(["x.z.e.r.afro.st@gmail.com",     # inbox sama -> dilewati
+                 "xz.e.rafrost@gmail.com",        # inbox sama -> dilewati
+                 "orang.b.aru@gmail.com"])        # inbox baru -> dipakai
+
+    class M:
+        def new_email(self):
+            return next(urut)
+
+    em = signup.fresh_email(M(), {"xzerafrost@gmail.com"})
+    assert em == "orang.b.aru@gmail.com", em
+
+    # kalau semua tabrakan, tetap kembalikan sesuatu (alur conflict yang urus),
+    # jangan menggantung atau melempar
+    class Same:
+        def new_email(self):
+            return "x.zerafrost@gmail.com"
+
+    em = signup.fresh_email(Same(), {"xzerafrost@gmail.com"}, tries=3)
+    assert em == "x.zerafrost@gmail.com"
+
+    # used_inboxes membaca akun.txt DAN accounts.json
+    d = tempfile.mkdtemp()
+    akun = _os.path.join(d, "akun.txt")
+    with open(akun, "w", encoding="utf-8") as f:
+        f.writelines(x + chr(10) for x in ["# komentar", "a.b.c@gmail.com"])
+    acc = _os.path.join(d, "accounts.json")
+    with open(acc, "w", encoding="utf-8") as f:
+        f.write('{"d.e.f@gmail.com": {"plan": "plus"}}')
+    old_pwd, old_acc = signup.PWD_SRC, signup.ACCOUNTS
+    signup.PWD_SRC, signup.ACCOUNTS = akun, acc
+    try:
+        keys = signup.used_inboxes()
+        assert "abc@gmail.com" in keys and "def@gmail.com" in keys, keys
+    finally:
+        signup.PWD_SRC, signup.ACCOUNTS = old_pwd, old_acc
+
+    # get_emails tak boleh memberi dua alamat dengan inbox sama dalam satu batch
+    _os.environ["EMAIL_SOURCE"] = "emailnator"
+    _os.environ["EMAIL_COUNT"] = "2"
+    importlib.reload(signup)
+    d2 = tempfile.mkdtemp()
+    signup.PWD_SRC = _os.path.join(d2, "akun.txt")
+    signup.ACCOUNTS = _os.path.join(d2, "accounts.json")
+    seq = iter(["p.q@gmail.com", "pq@gmail.com", "r.s@gmail.com"])
+    mailer.Emailnator.new_email = lambda self: next(seq)
+    got = signup.get_emails()
+    assert len(got) == 2, got
+    assert len({signup.gmail_key(e) for e in got}) == 2, got
+    for k in ("EMAIL_SOURCE", "EMAIL_COUNT"):
+        _os.environ.pop(k, None)
+    print("PASS: inbox Gmail tak dipakai dua kali")
+
+
+def test_no_head_of_line_block():
+    """Hasil dipanen dengan as_completed: akun yang kelar dulu dilaporkan dulu.
+
+    Kalau dipanen berurutan submit, satu akun yang masih menunggu OTP menahan
+    laporan akun lain yang sudah selesai -- tampak macet padahal jalan.
+    """
+    import inspect, time, signup
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    src = inspect.getsource(signup)
+    assert "for email, fut in [" not in src, \
+        "panen berurutan submit bikin akun cepat tertahan akun lambat"
+    assert src.count("as_completed(") >= 4, src.count("as_completed(")
+
+    # buktikan bedanya, bukan cuma cek bentuk kode
+    def job(i):
+        time.sleep(0.35 if i == 0 else 0.02)   # akun 0 lambat
+        return i
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {pool.submit(job, i): i for i in range(4)}
+        t0 = time.time()
+        first = None
+        for fut in as_completed(futs):
+            fut.result()
+            if first is None:
+                first = time.time() - t0
+    assert first < 0.3, f"laporan pertama tertahan {first:.2f}s"
+    print("PASS: akun cepat tak tertahan akun lambat")
+
+
 def main():
     if not os.path.exists(HAR):
         print("SKIP: HAR not found")
@@ -322,6 +522,10 @@ def main():
     test_proxy_real()
     test_proxy_retry()
     test_timeout()
+    test_mail_timeout_separate()
+    test_wait_otp_stops()
+    test_gmail_dedupe()
+    test_no_head_of_line_block()
     return 0
 
 
