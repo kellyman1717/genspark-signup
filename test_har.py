@@ -2,7 +2,10 @@
 """Self-check: verify signup.py parsing regexes against the real HAR data."""
 import json, re, sys, os
 
-HAR = r"C:\Users\EDITOR MEDIA 07\Downloads\www.genspark.ai.har"
+# HAR trace asal rekonstruksi alur. Hanya dipakai test parsing; test lain
+# jalan tanpa itu. Timpa lewat env var HAR atau argumen pertama.
+HAR = os.environ.get("HAR") or (sys.argv[1] if len(sys.argv) > 1 else "") or \
+    os.path.expanduser("~/Downloads/www.genspark.ai.har")
 
 
 def entry(har, i):
@@ -522,10 +525,12 @@ def test_coupon_fallback():
     print("PASS: coupon ditolak -> lanjut tanpa diskon, error lain tetap naik")
 
 
-def main():
+def test_har_parsing():
+    """Regex parsing dicocokkan ke HAR asli. Butuh file HAR; dilewati kalau
+    tak ada -- test lain tak bergantung padanya."""
     if not os.path.exists(HAR):
-        print("SKIP: HAR not found")
-        return 0
+        print(f"SKIP: HAR tak ada ({HAR}) -- test parsing dilewati")
+        return
     with open(HAR, encoding="utf-8") as f:
         har = json.load(f)
 
@@ -573,21 +578,25 @@ def main():
     assert user["data"]["cogen"]["email"] and "@" in user["data"]["cogen"]["email"]
 
     print(f"PASS: parsing verified against HAR ({len(har['log']['entries'])} entries)")
-    test_concurrency()
-    test_email_append()
-    test_fresh_client_for_signup()
-    test_dotenv()
-    test_conflict_retry()
-    test_proxy_real()
-    test_proxy_retry()
-    test_timeout()
-    test_mail_timeout_separate()
-    test_wait_otp_stops()
-    test_gmail_dedupe()
-    test_no_head_of_line_block()
-    test_wait_credit()
-    test_coupon_fallback()
-    return 0
+
+
+def main():
+    """Jalankan semua self-check. Yang butuh HAR dilewati kalau file tak ada."""
+    fails = 0
+    for fn in (test_har_parsing, test_concurrency, test_email_append,
+               test_fresh_client_for_signup, test_dotenv, test_conflict_retry,
+               test_proxy_real, test_proxy_retry, test_timeout,
+               test_mail_timeout_separate, test_wait_otp_stops,
+               test_gmail_dedupe, test_no_head_of_line_block,
+               test_wait_credit, test_coupon_fallback):
+        try:
+            fn()
+        except Exception as ex:
+            fails += 1
+            print(f"FAIL: {fn.__name__}: {type(ex).__name__}: {ex}")
+    print()
+    print("SEMUA LOLOS" if not fails else f"{fails} test GAGAL")
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":
