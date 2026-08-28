@@ -237,6 +237,32 @@ def test_proxy_retry():
     print("PASS: retry ganti proxy hanya untuk error jaringan")
 
 
+def test_timeout():
+    """Proxy yang diam harus gagal ~TIMEOUT detik, bukan menggantung 30s."""
+    import socket, time, proxies
+
+    srv = socket.socket()               # listen tapi tak pernah menjawab
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        t0 = time.time()
+        try:
+            proxies.build_opener("http://127.0.0.1:%d" % port).open(
+                "http://example.com/", timeout=2).read()
+            raise AssertionError("harus timeout")
+        except Exception as ex:
+            dt = time.time() - t0
+            assert 2 <= dt < 6, f"timeout tak dipatuhi: {dt:.1f}s"
+            assert proxies.is_network_error(ex), f"harus error jaringan: {ex!r}"
+    finally:
+        srv.close()
+
+    import signup
+    assert signup.TIMEOUT > 0
+    print("PASS: timeout dipatuhi, proxy hang cepat dipotong")
+
+
 def main():
     if not os.path.exists(HAR):
         print("SKIP: HAR not found")
@@ -295,6 +321,7 @@ def main():
     test_conflict_retry()
     test_proxy_real()
     test_proxy_retry()
+    test_timeout()
     return 0
 
 

@@ -32,7 +32,8 @@ def load_env(path=ENV_FILE):
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
     cfg.update({k: v for k, v in os.environ.items() if k in cfg or k in (
         "CAPTCHA_PROVIDER", "CAPTCHA_KEY", "CAPTCHA_TRIES",
-        "EMAIL_SOURCE", "EMAIL_COUNT", "OTP_TIMEOUT", "WORKERS", "PASSWORD")})
+        "EMAIL_SOURCE", "EMAIL_COUNT", "EMAIL_TRIES", "OTP_TIMEOUT",
+        "PROXY", "PROXY_TRIES", "TIMEOUT", "WORKERS", "PASSWORD")})
     return cfg
 
 
@@ -57,6 +58,9 @@ PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.txt
 PROXY_POOL = proxies.Pool(proxies.load(ENV.get("PROXY", ""), PROXY_FILE))
 # proxy publik banyak yang mati; coba proxy lain sebanyak ini kalau koneksi gagal
 PROXY_TRIES = int(ENV.get("PROXY_TRIES", "4"))
+# Timeout per request. Dibuat pendek supaya proxy mati cepat ketahuan:
+# menunggu 30s untuk proxy yang tak akan menjawab cuma memboroskan waktu.
+TIMEOUT = int(ENV.get("TIMEOUT", "5" if len(PROXY_POOL) else "30"))
 PASSWORD = ENV.get("PASSWORD", "Masuk@123456")  # password semua akun
 IO_LOCK = threading.Lock()  # accounts.json + stdout
 
@@ -88,7 +92,7 @@ def record_emails(fresh):
 def get_emails():
     """EMAIL_SOURCE=file -> baca akun.txt. =emailnator -> bikin alamat baru."""
     if EMAIL_SOURCE.lower() == "emailnator":
-        m = mailer.Emailnator(proxy=PROXY_POOL.next())
+        m = mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT)
         fresh = [m.new_email() for _ in range(EMAIL_COUNT)]
         record_emails(fresh)
         return fresh
@@ -128,7 +132,7 @@ class Client:
             h.setdefault("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
         r = urllib.request.Request(url, data=body, headers=h, method=method)
         try:
-            return self.opener.open(r, timeout=30)
+            return self.opener.open(r, timeout=TIMEOUT)
         except urllib.error.HTTPError as e:
             if 300 <= e.code < 400:
                 return e  # expose redirect for Location handling
@@ -159,7 +163,7 @@ class Client:
         }
         body = json.dumps(data).encode() if data is not None else None
         r = urllib.request.Request(APP + path, data=body, headers=h)
-        return json.load(self.opener.open(r, timeout=30))
+        return json.load(self.opener.open(r, timeout=TIMEOUT))
 
     def jget(self, url):
         return json.load(self.api(url))
@@ -442,7 +446,7 @@ def get_otp(email, proxy=None):
             raise RuntimeError("otp kosong")
         return otp
     log(f"  [{email}] nunggu OTP di inbox...")
-    return mailer.wait_otp(mailer.Emailnator(proxy=proxy), email, sender="genspark",
+    return mailer.wait_otp(mailer.Emailnator(proxy=proxy, timeout=TIMEOUT), email, sender="genspark",
                            timeout=OTP_TIMEOUT, log=log)
 
 
@@ -491,7 +495,7 @@ def interactive_signup(email, tries=EMAIL_TRIES):
                     f"{email} sudah terdaftar tapi password bukan '{PASSWORD}'. "
                     "Set PASSWORD di .env sesuai akun itu, atau pakai email lain."
                 ) from None
-            baru = mailer.Emailnator(proxy=PROXY_POOL.next()).new_email()
+            baru = mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT).new_email()
             log(f"  [{email}] sudah dipakai -> tukar ke {baru}")
             record_emails([baru])
             email = baru
@@ -551,8 +555,10 @@ def main():
         except Exception as ex:
             print(f"captcha: {prov} - key ditolak: {ex}")
             return
-    print(f"proxy  : {len(PROXY_POOL)} proxy (round-robin)"
-          if len(PROXY_POOL) else "proxy  : tak dipakai (koneksi langsung)")
+    print(f"proxy  : {len(PROXY_POOL)} proxy (round-robin, timeout {TIMEOUT}s, "
+          f"ganti sampai {PROXY_TRIES}x)"
+          if len(PROXY_POOL) else
+          f"proxy  : tak dipakai (koneksi langsung, timeout {TIMEOUT}s)")
     print(f"email  : {EMAIL_SOURCE.lower()}"
           + (" (OTP otomatis)" if EMAIL_SOURCE.lower() == "emailnator"
              else " (OTP diketik manual)"))

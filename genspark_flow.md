@@ -425,4 +425,19 @@ Pembeda ada di `proxies.is_network_error()`. `HTTPError` sengaja dikecualikan: g
 
 Pool kosong -> satu percobaan saja, tanpa retry.
 
-Tambahan `.env`: `PROXY_TRIES=4`.
+Tambahan `.env`: `PROXY_TRIES=4`, `TIMEOUT=5`.
+
+### Timeout
+
+`TIMEOUT` (detik) membatasi tiap request. Default menyesuaikan: **5** kalau pool proxy terisi, **30** kalau koneksi langsung.
+
+Alasannya proxy busuk punya dua cara gagal, dan yang kedua mahal:
+
+| Gejala | Waktu gagal |
+|---|---|
+| `Tunnel connection failed: 400` | langsung, proxy menolak |
+| `WinError 10060` / `SSL: UNEXPECTED_EOF` | menggantung sampai timeout |
+
+Dengan timeout 30s, empat percobaan proxy diam = 2 menit terbuang per akun. Dengan 5s = 20 detik. Terukur: proxy yang listen tapi tak menjawab gagal tepat pada batas timeout.
+
+Naikkan kalau proxy kamu lambat tapi sehat (`TIMEOUT=10`); turunkan kalau daftar proxy banyak sampahnya (`TIMEOUT=3`).

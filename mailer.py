@@ -24,8 +24,9 @@ ADS = {"ADSVPN"}  # messageID iklan bawaan emailnator, bukan email nyata
 
 
 class Emailnator:
-    def __init__(self, kind=KIND, proxy=None):
+    def __init__(self, kind=KIND, proxy=None, timeout=30):
         self.kind = kind
+        self.timeout = timeout
         self.jar = http.cookiejar.CookieJar()
         # token XSRF diikat ke sesi, jadi satu proxy dipegang sepanjang hidup objek
         self.proxy = proxy
@@ -35,7 +36,7 @@ class Emailnator:
 
     def _bootstrap(self):
         r = urllib.request.Request(HOST + "/", headers={"User-Agent": UA})
-        with self.opener.open(r, timeout=30) as resp:
+        with self.opener.open(r, timeout=self.timeout) as resp:
             resp.read()
         self.token = next((urllib.parse.unquote(c.value)
                            for c in self.jar if c.name == "XSRF-TOKEN"), None)
@@ -56,7 +57,7 @@ class Emailnator:
                 "Origin": HOST,
                 "Referer": HOST + "/",
             })
-        with self.opener.open(r, timeout=45) as resp:
+        with self.opener.open(r, timeout=self.timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
         try:
             return json.loads(raw)
