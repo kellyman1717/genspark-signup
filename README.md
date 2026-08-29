@@ -59,10 +59,21 @@ Diatur lewat `.env` atau form WebUI:
 DUMP_MIN_CREDIT=2000   ; simpan kalau credit >= ini
 DUMP_TARGET=1          ; berhenti setelah dapat sebanyak ini
 DUMP_MAX_TRIES=10      ; batas percobaan (tiap percobaan pakai captcha)
+DUMP_WORKERS=3         ; akun digarap serentak
+DUMP_CREDIT_WAIT=25    ; detik menunggu credit menyusul setelah signup
 ```
 
 Butuh `EMAIL_SOURCE=emailnator`. Akun yang lolos tetap dibuatkan API key,
 jadi langsung terbaca `py signup.py credit`.
+
+Dump berjalan **paralel** (`DUMP_WORKERS`) dan hanya menjalankan sebanyak
+yang masih dibutuhkan — kalau target sisa satu, ia tak memulai tiga worker
+sekaligus, jadi captcha tak terbuang. Kalau `CAPTCHA_PROVIDER=manual`,
+paralel dipaksa jadi 1 karena jawaban captcha diketik satu per satu.
+
+`DUMP_CREDIT_WAIT` penting: plan naik lebih dulu daripada credit
+dikreditkan, jadi membaca saldo terlalu cepat memberi 100 (bonus akun
+gratis) dan akun bagus ikut terbuang.
 
 ### WebUI
 

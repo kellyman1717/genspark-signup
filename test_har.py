@@ -538,6 +538,80 @@ def test_coupon_fallback():
     print("PASS: coupon ditolak -> lanjut tanpa diskon, error lain tetap naik")
 
 
+def test_dump_parallel():
+    """Dump paralel: berhenti begitu target tercapai, tak boros captcha, dan
+    hasil yang sudah jadi tetap dilaporkan. Tanpa jaringan."""
+    import importlib, os as _os, tempfile, threading, time, signup
+
+    _os.environ.update({"EMAIL_SOURCE": "emailnator", "PASSWORD": "X@1abcde",
+                        "DUMP_TARGET": "2", "DUMP_MAX_TRIES": "10",
+                        "DUMP_WORKERS": "3", "DUMP_MIN_CREDIT": "2000",
+                        "CAPTCHA_PROVIDER": "2captcha", "CAPTCHA_KEY": "k"})
+    importlib.reload(signup)
+    d = tempfile.mkdtemp()
+    signup.ACCOUNTS = _os.path.join(d, "accounts.json")
+    signup.PWD_SRC = _os.path.join(d, "akun.txt")
+    signup.log = lambda *a: None
+
+    # dump_one tiruan: hitung berapa yang benar-benar dijalankan
+    calls, lock = [], threading.Lock()
+    peak = [0]
+    live = [0]
+
+    def fake(accounts, credit=5000):
+        with lock:
+            calls.append(1)
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.05)                  # biar worker benar-benar tumpang tindih
+        with lock:
+            live[0] -= 1
+        n = len(calls)
+        return f"a{n}@g.com", credit, "plus", credit >= 2000
+
+    signup.dump_one = fake
+    out = []
+    orig_print = __builtins__["print"] if isinstance(__builtins__, dict) \
+        else __builtins__.print
+    try:
+        import builtins
+        builtins.print = lambda *a, **k: out.append(" ".join(map(str, a)))
+        signup.dump_mode()
+    finally:
+        import builtins
+        builtins.print = orig_print
+
+    # target 2, tiap percobaan sukses -> tak boleh jalan 10x
+    assert len(calls) <= 4, f"boros captcha: {len(calls)} percobaan untuk target 2"
+    assert peak[0] > 1, f"tak benar-benar paralel (puncak {peak[0]} worker)"
+    joined = " ".join(out)
+    assert "tersimpan 2 akun" in joined, joined[-200:]
+
+    # captcha manual -> WAJIB serial, karena jawaban diketik satu-satu
+    _os.environ["CAPTCHA_PROVIDER"] = "manual"
+    importlib.reload(signup)
+    signup.ACCOUNTS = _os.path.join(d, "a2.json")
+    signup.PWD_SRC = _os.path.join(d, "k2.txt")
+    signup.log = lambda *a: None
+    calls.clear(); peak[0] = 0; live[0] = 0
+    signup.dump_one = fake
+    try:
+        import builtins
+        builtins.print = lambda *a, **k: None
+        signup.dump_mode()
+    finally:
+        import builtins
+        builtins.print = orig_print
+    assert peak[0] == 1, f"captcha manual harus serial, puncak {peak[0]}"
+
+    for k in ("EMAIL_SOURCE", "PASSWORD", "DUMP_TARGET", "DUMP_MAX_TRIES",
+              "DUMP_WORKERS", "DUMP_MIN_CREDIT", "CAPTCHA_PROVIDER",
+              "CAPTCHA_KEY"):
+        _os.environ.pop(k, None)
+    importlib.reload(signup)
+    print("PASS: dump paralel berhenti di target, manual tetap serial")
+
+
 def test_har_parsing():
     """Regex parsing dicocokkan ke HAR asli. Butuh file HAR; dilewati kalau
     tak ada -- test lain tak bergantung padanya."""
@@ -601,7 +675,7 @@ def main():
                test_proxy_real, test_proxy_retry, test_timeout,
                test_mail_timeout_separate, test_wait_otp_stops,
                test_gmail_dedupe, test_no_head_of_line_block,
-               test_wait_credit, test_coupon_fallback):
+               test_wait_credit, test_coupon_fallback, test_dump_parallel):
         try:
             fn()
         except Exception as ex:

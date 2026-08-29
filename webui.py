@@ -50,6 +50,8 @@ DEFAULTS = {
     "DUMP_MIN_CREDIT": "2000",
     "DUMP_TARGET": "1",
     "DUMP_MAX_TRIES": "10",
+    "DUMP_WORKERS": "3",
+    "DUMP_CREDIT_WAIT": "25",
 }
 
 # Skema form: (grup, tab, [(key, tipe, label, opsi, hint), ...]).
@@ -99,6 +101,10 @@ GROUPS = [
          "berhenti setelah dapat sebanyak ini"),
         ("DUMP_MAX_TRIES", "number", "Maks percobaan", None,
          "batas atas biar tak jalan selamanya"),
+        ("DUMP_WORKERS", "number", "Paralel", None,
+         "akun digarap serentak; dipaksa 1 kalau captcha manual"),
+        ("DUMP_CREDIT_WAIT", "number", "Tunggu credit (detik)", None,
+         "credit menyusul setelah signup; jangan baca terlalu cepat"),
     ]),
 ]
 
@@ -500,6 +506,9 @@ PAGE = r"""<!doctype html>
   .filters .lab{font-size:11.5px}
   .tally{color:var(--muted);font-size:12.5px;margin-left:auto;
          align-self:center}
+  tr.picked{background:rgba(240,84,84,.10)}
+  input[type=checkbox]{width:15px;height:15px;accent-color:var(--acc);
+                       cursor:pointer;padding:0}
 </style>
 </head>
 <body>
@@ -623,10 +632,16 @@ PAGE = r"""<!doctype html>
       </div>
 
       <div class="row" style="margin-bottom:4px">
-        <button class="primary" onclick="copyAllKeys()">Copy semua API key</button>
-        <button onclick="copyAllKeys('csv')"
-                title="email,api_key,plan,credit per baris">Copy sebagai CSV</button>
+        <button class="primary" onclick="copyKeys('sel')" id="btn-copy-sel"
+                disabled>Copy terpilih</button>
+        <button onclick="copyKeys('all')">Copy semua</button>
+        <button onclick="copyKeys('sel','csv')" id="btn-csv-sel" disabled
+                title="email,api_key,plan,credit">CSV terpilih</button>
+        <button onclick="copyKeys('all','csv')"
+                title="email,api_key,plan,credit">CSV semua</button>
         <button class="sm" onclick="toggleAllKeys()" id="btn-reveal">Lihat semua key</button>
+        <button class="sm danger" onclick="deleteSelected()" id="btn-del-sel"
+                disabled>Hapus terpilih</button>
       </div>
       <div class="flash" id="flash-hasil"></div>
       <div id="accounts" class="empty">memuat…</div>
@@ -788,13 +803,19 @@ function renderRows(){
   if(!total){el.innerHTML='<div class="empty">belum ada akun.</div>';return;}
   if(!rows.length){
     el.innerHTML='<div class="empty">tak ada akun yang cocok dengan filter.</div>';
-    return;}
-  let html='<table><thead><tr><th>email</th><th>plan</th><th>credit</th>'+
+    syncSelUI(); return;}
+  let html='<table><thead><tr>'+
+    '<th style="width:26px"><input type="checkbox" id="ck-all" '+
+      'title="pilih semua yang tampil"></th>'+
+    '<th>email</th><th>plan</th><th>credit</th>'+
     '<th>api_key</th><th>bayar</th><th>dibuat</th><th></th></tr></thead><tbody>';
   for(const [email,v] of rows){
     const full=v.api_key||'';
     const shown=showKeys?full:(full?full.slice(0,16)+'…':'');
-    html+='<tr><td>'+esc(email)+'</td>'+
+    const ck=SEL.has(email)?' checked':'';
+    html+='<tr'+(SEL.has(email)?' class="picked"':'')+'>'+
+      '<td><input type="checkbox" class="ck-row" data-email="'+esc(email)+'"'+ck+'></td>'+
+      '<td>'+esc(email)+'</td>'+
       '<td class="plan-badge">'+esc(v.plan||'')+'</td>'+
       '<td>'+esc(String(v.credit??''))+'</td>'+
       '<td><div class="keycell">'+
@@ -811,6 +832,31 @@ function renderRows(){
       '"'+(RUNNING?' disabled':'')+'>Hapus</button></td></tr>';
   }
   el.innerHTML=html+'</tbody></table>';
+  syncSelUI();
+}
+
+// ---- pilihan (checkbox) ----
+const SEL=new Set();          // email yang dicentang
+
+function syncSelUI(){
+  const shown=filtered().map(([e])=>e);
+  // buang pilihan yang tak lagi tampil karena filter berubah
+  for(const e of [...SEL]) if(!shown.includes(e)) SEL.delete(e);
+  const n=SEL.size;
+  ['btn-copy-sel','btn-csv-sel'].forEach(id=>{
+    const b=$(id); if(b) b.disabled=!n;});
+  const bd=$('btn-del-sel');
+  if(bd) bd.disabled=!n||RUNNING;
+  ['btn-copy-sel','btn-csv-sel'].forEach(id=>{
+    const b=$(id);
+    if(b) b.textContent=(id==='btn-copy-sel'?'Copy terpilih':'CSV terpilih')+
+      (n?' ('+n+')':'');});
+  if(bd) bd.textContent='Hapus terpilih'+(n?' ('+n+')':'');
+  const all=$('ck-all');
+  if(all){
+    all.checked = shown.length>0 && n===shown.length;
+    all.indeterminate = n>0 && n<shown.length;
+  }
 }
 
 let lastAccJson='';
@@ -842,18 +888,58 @@ async function copyText(text){
   }
 }
 
-async function copyAllKeys(fmt){
-  const rows=filtered().filter(([,v])=>v.api_key);
-  if(!rows.length){flash('tak ada API key untuk dicopy','err');return;}
+async function copyKeys(scope, fmt){
+  let rows=filtered().filter(([,v])=>v.api_key);
+  if(scope==='sel') rows=rows.filter(([e])=>SEL.has(e));
+  if(!rows.length){
+    flash(scope==='sel'?'belum ada baris dipilih':'tak ada API key untuk dicopy','err');
+    return;}
   const text = fmt==='csv'
     ? 'email,api_key,plan,credit\n'+rows.map(([e,v])=>
         [e, v.api_key, v.plan||'', v.credit??''].join(',')).join('\n')
     : rows.map(([,v])=>v.api_key).join('\n');
   const ok=await copyText(text);
-  flash(ok ? rows.length+' API key dicopy'+(fmt==='csv'?' (CSV)':'')
+  flash(ok ? rows.length+' API key dicopy'+(fmt==='csv'?' (CSV)':'')+
+             (scope==='sel'?' — dari pilihan':'')
            : 'gagal copy — browser menolak akses clipboard',
         ok?'ok':'err');
 }
+
+async function deleteSelected(){
+  const list=[...SEL];
+  if(!list.length) return;
+  if(!confirm('Hapus '+list.length+' akun dari accounts.json?')) return;
+  let ok=0, fail=0;
+  for(const email of list){
+    const j=await jpost('/api/delete-account', new URLSearchParams({email}));
+    if(j.ok){ok++; SEL.delete(email);} else fail++;
+  }
+  flash(ok+' akun dihapus'+(fail?', '+fail+' gagal':''), fail?'err':'ok');
+  lastAccJson='';          // paksa bangun ulang tabel
+  loadState();
+}
+
+// checkbox: pilih satu / pilih semua yang tampil
+document.addEventListener('change', (ev)=>{
+  const row=ev.target.closest('.ck-row');
+  if(row){
+    const email=row.dataset.email;
+    if(row.checked) SEL.add(email); else SEL.delete(email);
+    row.closest('tr').classList.toggle('picked', row.checked);
+    syncSelUI();
+    return;
+  }
+  if(ev.target.id==='ck-all'){
+    const on=ev.target.checked;
+    SEL.clear();
+    if(on) filtered().forEach(([e])=>SEL.add(e));
+    document.querySelectorAll('.ck-row').forEach(c=>{
+      c.checked=on;
+      c.closest('tr').classList.toggle('picked', on);
+    });
+    syncSelUI();
+  }
+});
 
 document.addEventListener('click', async (ev)=>{
   // copy satu API key

@@ -86,6 +86,13 @@ FREE_CREDIT = int(ENV.get("FREE_CREDIT", "200"))
 DUMP_MIN_CREDIT = int(ENV.get("DUMP_MIN_CREDIT", "2000"))  # ambang simpan
 DUMP_TARGET = int(ENV.get("DUMP_TARGET", "1"))    # berapa akun bagus dicari
 DUMP_MAX_TRIES = int(ENV.get("DUMP_MAX_TRIES", "10"))  # batas percobaan
+# berapa akun digarap serentak. Dipaksa 1 kalau captcha manual: jawaban
+# diketik satu-satu, jadi dua prompt sekaligus tak bisa dijawab.
+DUMP_WORKERS = max(int(ENV.get("DUMP_WORKERS", "3")), 1)
+# detik menunggu credit/plan menyusul setelah signup. Pendek: akun yang cuma
+# dapat bonus gratis tak akan naik, dan menunggu lama menghambat antrean.
+DUMP_CREDIT_WAIT = int(ENV.get("DUMP_CREDIT_WAIT", "25"))
+DUMP_LOCK = threading.Lock()   # accounts dict + alokasi alamat email
 
 # Tier dari HAR /api/payment/sub2/tier_config. Ganti TIER_ID untuk paket lain.
 TIER_ID = "plus1"
@@ -776,22 +783,32 @@ def dump_one(accounts):
     di bawah ambang tetap dilaporkan (biar distribusinya kelihatan) tapi
     tidak masuk accounts.json.
     """
-    em = fresh_email(
-        mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=MAIL_TIMEOUT),
-        used_inboxes())
-    record_emails([em])          # catat biar tak dipakai ulang lain kali
+    # Ambil alamat + catat SEKALIGUS di bawah satu lock: kalau tidak, dua
+    # worker bisa membaca used_inboxes() yang sama lalu dapat inbox kembar
+    # (Gmail mengabaikan titik) dan yang kedua kena conflict.
+    with DUMP_LOCK:
+        em = fresh_email(
+            mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=MAIL_TIMEOUT),
+            used_inboxes())
+        record_emails([em])      # catat biar tak dipakai ulang lain kali
     log(f"  [{em}] bikin akun...")
     used, c, cogen = interactive_signup(em)
 
-    plan = cogen.get("plan", "free")
-    credit = c.credit_balance()
+    # Plan dan credit MENYUSUL beberapa saat setelah signup: membaca saldo
+    # langsung memberi 100 (bonus akun gratis), bukan kuota sebenarnya.
+    # Tunggu, tapi jangan lama-lama -- akun yang memang cuma dapat bonus
+    # gratis tak akan pernah naik, dan menunggu 120s per akun menghambat
+    # seluruh antrean dump.
+    credit = c.wait_credit(floor=min(FREE_CREDIT, DUMP_MIN_CREDIT - 1),
+                           timeout=DUMP_CREDIT_WAIT, interval=3, email=used)
+    plan = c.get_user()["data"]["cogen"].get("plan", "free")
     log(f"  [{used}] plan={plan} credit={credit} (ambang {DUMP_MIN_CREDIT})")
     if credit < DUMP_MIN_CREDIT:
         return used, credit, plan, False
 
     key_name = f"gk-{int(time.time() * 1000)}"
     token = c.create_api_key(key_name)
-    accounts[used] = {
+    rec = {
         "email": cogen["email"],
         "cogen_id": cogen["id"],
         "api_key": token,
@@ -802,7 +819,11 @@ def dump_one(accounts):
         "proxy": c.proxy or "direct",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    save_accounts(accounts)
+    # accounts dict dibagi antar worker -> ubah + tulis di bawah lock, biar
+    # tak ada akun yang hilang karena dua worker menyimpan bersamaan
+    with DUMP_LOCK:
+        accounts[used] = rec
+        save_accounts(accounts)
     log(f"  [{used}] DISIMPAN credit={credit} api_key={token[:24]}...")
     return used, credit, plan, True
 
@@ -819,28 +840,56 @@ def dump_mode():
         return
 
     prov = (CAPTCHA_PROVIDER or "manual").lower()
+    # captcha manual = jawaban diketik manusia satu-satu; dua prompt serentak
+    # tak bisa dijawab, jadi paralel dimatikan.
+    workers = 1 if prov == "manual" else min(DUMP_WORKERS, DUMP_MAX_TRIES)
     print(f"== dump: cari {DUMP_TARGET} akun dengan credit >= {DUMP_MIN_CREDIT} "
           f"(maks {DUMP_MAX_TRIES} percobaan) ==")
     print(f"captcha: {prov}"
           + ("" if prov == "manual" else f" (saldo dicek saat dipakai)"))
+    print(f"paralel: {workers} akun serentak"
+          + (" (captcha manual -> dipaksa serial)" if prov == "manual"
+             and DUMP_WORKERS > 1 else ""))
     print("tanpa checkout Stripe: tak ada kartu, tak ada tagihan.")
     print()
 
     accounts = load_accounts()
     saved, rows = [], []
-    for n in range(1, DUMP_MAX_TRIES + 1):
-        if len(saved) >= DUMP_TARGET:
-            break
-        print(f"-- percobaan {n}/{DUMP_MAX_TRIES} "
-              f"(terkumpul {len(saved)}/{DUMP_TARGET}) --")
-        try:
-            email, credit, plan, keep = dump_one(accounts)
-            rows.append((email, credit, plan, keep))
-            if keep:
-                saved.append(email)
-        except Exception as ex:
-            log(f"  GAGAL: {ex}")
-            rows.append(("?", -1, "?", False))
+    started = done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {}
+        # isi kolam sampai penuh, lalu tiap satu selesai -> jalankan satu lagi
+        # HANYA kalau target belum tercapai, jadi captcha tak diboroskan.
+        # Yang sudah berjalan tetap dipanen sampai habis: akun yang sudah
+        # jadi (dan sudah masuk accounts.json) harus tetap dilaporkan.
+        # Jangan pernah menjalankan lebih dari sisa kebutuhan: kalau target
+        # sisa 1, memulai 3 worker berarti 2 captcha terbuang. Yang sedang
+        # berjalan ikut dihitung sebagai "calon berhasil".
+        def room():
+            butuh = DUMP_TARGET - len(saved) - len(futs)
+            return max(min(butuh, DUMP_MAX_TRIES - started), 0)
+
+        while len(futs) < workers and room() > 0:
+            started += 1
+            futs[pool.submit(dump_one, accounts)] = started
+        while futs:
+            fut = next(as_completed(list(futs)))
+            n = futs.pop(fut)
+            done += 1
+            try:
+                email, credit, plan, keep = fut.result()
+                rows.append((email, credit, plan, keep))
+                if keep:
+                    saved.append(email)
+            except Exception as ex:
+                log(f"  [percobaan {n}] GAGAL: {ex}")
+                rows.append(("?", -1, "?", False))
+            log(f"-- selesai {done} (terkumpul {len(saved)}/{DUMP_TARGET}, "
+                f"dimulai {started}/{DUMP_MAX_TRIES}) --")
+            # isi ulang hanya sebanyak yang masih benar-benar dibutuhkan
+            while len(futs) < workers and room() > 0:
+                started += 1
+                futs[pool.submit(dump_one, accounts)] = started
 
     print()
     print("=== HASIL DUMP ===")
