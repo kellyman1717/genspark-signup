@@ -52,19 +52,20 @@ DEFAULTS = {
     "DUMP_MAX_TRIES": "10",
 }
 
-# Skema form: (grup, [(key, tipe, label, opsi, hint), ...]).
+# Skema form: (grup, tab, [(key, tipe, label, opsi, hint), ...]).
+# tab: "setting" (halaman Setting) | "dump" (tampil langsung di halaman Dump)
 GROUPS = [
-    ("Captcha", [
+    ("Captcha", "setting", [
         ("CAPTCHA_PROVIDER", "select", "Provider",
          ["manual", "2captcha", "capsolver", "anticaptcha", "capmonster",
           "rucaptcha", "azcaptcha"],
-         "manual = ketik sendiri (belum didukung di WebUI)"),
+         "manual = captcha ditampilkan di halaman ini untuk diketik"),
         ("CAPTCHA_KEY", "password", "API key", None,
          "kosongkan kalau manual"),
         ("CAPTCHA_TRIES", "number", "Coba ulang", None,
          "berapa kali solver boleh salah baca"),
     ]),
-    ("Email", [
+    ("Email", "setting", [
         ("EMAIL_SOURCE", "select", "Sumber email", ["file", "emailnator"],
          "emailnator = alamat + OTP otomatis"),
         ("EMAIL_COUNT", "number", "Jumlah akun", None, "kalau emailnator"),
@@ -73,7 +74,7 @@ GROUPS = [
         ("OTP_TIMEOUT", "number", "Timeout OTP (detik)", None,
          "berapa lama nunggu OTP masuk inbox"),
     ]),
-    ("Proxy", [
+    ("Proxy", "setting", [
         ("PROXY", "textarea", "Proxy", None,
          "koma / baris, atau di proxy.txt; kosong = koneksi langsung"),
         ("PROXY_TRIES", "number", "Coba proxy", None,
@@ -83,7 +84,7 @@ GROUPS = [
         ("MAIL_TIMEOUT", "number", "Timeout inbox (detik)", None,
          "minimal 20, emailnator lambat"),
     ]),
-    ("Akun & Jalankan", [
+    ("Akun & Jalankan", "setting", [
         ("PASSWORD", "password", "Password", None,
          "wajib; syarat Azure B2C: kapital+kecil+angka+simbol, min 8"),
         ("WORKERS", "number", "Worker paralel", None, ""),
@@ -91,7 +92,7 @@ GROUPS = [
         ("FREE_CREDIT", "number", "Batas credit gratis", None,
          "credit di atas ini = kuota langganan masuk"),
     ]),
-    ("Dump (tanpa checkout)", [
+    ("Aturan dump", "dump", [
         ("DUMP_MIN_CREDIT", "number", "Ambang credit", None,
          "akun disimpan kalau creditnya >= ini"),
         ("DUMP_TARGET", "number", "Target akun bagus", None,
@@ -385,39 +386,57 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>genspark-signup</title>
 <style>
-  :root{--bg:#0f1216;--panel:#171b21;--panel2:#1e232b;--line:#2a323c;
-        --text:#d7e0ea;--muted:#8894a3;--acc:#4f9dff;--ok:#3ecf8e;
-        --warn:#ffb454;--bad:#ff6b6b}
+  /* palet: #DDDDDD #222831 #30475E #F05454 */
+  :root{--bg:#222831;--panel:#272e39;--panel2:#30475E;--line:#3a5471;
+        --text:#DDDDDD;--muted:#9aa8b8;--acc:#F05454;--acc-lite:#f47070;
+        --ok:#7fd1a8;--warn:#e8b866;--bad:#F05454}
   *{box-sizing:border-box}
   body{margin:0;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;
        background:var(--bg);color:var(--text)}
-  header{padding:14px 22px;border-bottom:1px solid var(--line);
-         display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  header h1{font-size:17px;margin:0;font-weight:600}
-  header .sub{color:var(--muted);font-size:12.5px}
+  header{padding:12px 22px;border-bottom:1px solid var(--line);
+         display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+         background:var(--panel)}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.01em}
+  header .sub{color:var(--muted);font-size:12px}
   .badge{padding:3px 10px;border-radius:20px;font-size:12px;
          border:1px solid var(--line);background:var(--panel2)}
   .badge.idle{color:var(--muted)}
-  .badge.run{color:#06121c;background:var(--acc);border-color:var(--acc);
+  .badge.run{color:#1a1a1a;background:var(--ok);border-color:var(--ok);
              font-weight:600}
-  main{display:grid;grid-template-columns:minmax(340px,44fr) 56fr;
-       gap:16px;padding:16px 22px;align-items:start}
-  @media(max-width:920px){main{grid-template-columns:1fr}}
+
+  /* ---- navigasi tab ---- */
+  nav{display:flex;gap:4px;padding:0 22px;background:var(--panel);
+      border-bottom:1px solid var(--line);flex-wrap:wrap}
+  nav button{background:transparent;border:0;border-bottom:2px solid transparent;
+             color:var(--muted);padding:11px 16px;border-radius:0;
+             font:inherit;font-weight:500;cursor:pointer}
+  nav button:hover{color:var(--text);background:var(--panel2)}
+  nav button.on{color:var(--text);border-bottom-color:var(--acc);
+                font-weight:600}
+
+  main{padding:16px 22px}
+  .page{display:none}
+  .page.on{display:grid;grid-template-columns:minmax(320px,42fr) 58fr;
+           gap:16px;align-items:start}
+  @media(max-width:920px){.page.on{grid-template-columns:1fr}}
+  .page.solo.on{grid-template-columns:1fr;max-width:900px}
   section{background:var(--panel);border:1px solid var(--line);
-          border-radius:12px;padding:16px}
-  section h2{font-size:14px;margin:0 0 12px;font-weight:600}
+          border-radius:10px;padding:16px}
+  section h2{font-size:14px;margin:0 0 4px;font-weight:600}
+  section .desc{color:var(--muted);font-size:12.5px;margin-bottom:12px}
   fieldset{border:0;margin:0 0 14px;padding:0}
-  legend{font-size:12px;color:var(--acc);text-transform:uppercase;
-         letter-spacing:.06em;margin-bottom:8px;font-weight:600}
+  legend{font-size:11.5px;color:var(--acc-lite);text-transform:uppercase;
+         letter-spacing:.07em;margin-bottom:8px;font-weight:700}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
-  @media(max-width:480px){.grid{grid-template-columns:1fr}}
+  @media(max-width:520px){.grid{grid-template-columns:1fr}}
   .field{display:flex;flex-direction:column;gap:4px}
   .field.full{grid-column:1 / -1}
   .lab{font-size:12px;color:var(--muted)}
   input,select,textarea{background:var(--panel2);border:1px solid var(--line);
-       color:var(--text);border-radius:8px;padding:8px 10px;font:inherit;
+       color:var(--text);border-radius:7px;padding:8px 10px;font:inherit;
        width:100%}
-  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc)}
+  input:focus,select:focus,textarea:focus{outline:none;
+       border-color:var(--acc-lite)}
   textarea{font-family:ui-monospace,Consolas,monospace;font-size:12px}
   .hint{font-size:11.5px;color:var(--muted)}
   .pwrap{position:relative}
@@ -425,9 +444,9 @@ PAGE = r"""<!doctype html>
   .eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);
        background:transparent;border:0;padding:4px;color:var(--muted);
        cursor:pointer;display:flex}
-  .eye:hover{color:var(--acc)}
-  .ask-box{border:1px solid var(--warn);border-radius:10px;padding:12px;
-           margin-bottom:12px;background:#221d12}
+  .eye:hover{color:var(--text)}
+  .ask-box{border:1px solid var(--warn);border-radius:9px;padding:12px;
+           margin-bottom:12px;background:#2c3038}
   .ask-box .lab{color:var(--warn);font-weight:600;font-size:12.5px;
                 margin-bottom:8px;display:block}
   .ask-box img{display:block;max-width:220px;border-radius:6px;margin-bottom:8px;
@@ -435,19 +454,21 @@ PAGE = r"""<!doctype html>
   .ask-box .row input{max-width:220px}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   button{background:var(--panel2);color:var(--text);border:1px solid var(--line);
-         padding:9px 16px;border-radius:8px;font:inherit;cursor:pointer}
-  button:hover{border-color:var(--acc)}
+         padding:9px 16px;border-radius:7px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--acc);background:#3a5471}
   button.primary{background:var(--acc);border-color:var(--acc);
-         color:#06121c;font-weight:600}
+         color:#fff;font-weight:600}
+  button.primary:hover{background:var(--acc-lite);border-color:var(--acc-lite)}
   button.danger:hover{border-color:var(--bad);color:var(--bad)}
-  button:disabled{opacity:.45;cursor:not-allowed}
-  #flash{font-size:12.5px;color:var(--muted)}
-  #flash.ok{color:var(--ok)} #flash.err{color:var(--bad)}
-  #log{background:#0a0d10;border:1px solid var(--line);border-radius:8px;
-       height:46vh;min-height:240px;overflow:auto;padding:10px 12px;
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.sm{padding:5px 10px;font-size:12px}
+  .flash{font-size:12.5px;color:var(--muted);min-height:1.3em}
+  .flash.ok{color:var(--ok)} .flash.err{color:var(--bad)}
+  .logbox{background:#1b2027;border:1px solid var(--line);border-radius:8px;
+       height:42vh;min-height:220px;overflow:auto;padding:10px 12px;
        font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;
        word-break:break-word}
-  #log .dim{color:var(--muted)}
+  .logbox .dim{color:var(--muted)}
   table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);
         vertical-align:top;word-break:break-all}
@@ -455,46 +476,162 @@ PAGE = r"""<!doctype html>
      background:var(--panel)}
   .empty{color:var(--muted);font-size:12.5px;padding:6px 0}
   .plan-badge{color:var(--ok)}
+  .note{border-left:3px solid var(--acc);background:var(--panel2);
+        padding:9px 12px;border-radius:0 7px 7px 0;font-size:12.5px;
+        color:var(--muted);margin-bottom:12px}
+  .note b{color:var(--text)}
+
+  /* ---- tabel hasil: api key + filter ---- */
+  .keycell{display:flex;align-items:center;gap:6px}
+  .keytext{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;
+           max-width:230px;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap}
+  .keytext.show{white-space:normal;word-break:break-all;max-width:340px}
+  .iconbtn{background:transparent;border:1px solid transparent;padding:3px 5px;
+           border-radius:5px;color:var(--muted);cursor:pointer;
+           display:inline-flex;align-items:center;line-height:1}
+  .iconbtn:hover{color:var(--text);background:var(--panel2);
+                 border-color:var(--line)}
+  .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;
+           padding:12px;background:var(--panel2);border:1px solid var(--line);
+           border-radius:8px;margin-bottom:12px}
+  .filters .f{display:flex;flex-direction:column;gap:4px}
+  .filters .f input,.filters .f select{min-width:120px}
+  .filters .lab{font-size:11.5px}
+  .tally{color:var(--muted);font-size:12.5px;margin-left:auto;
+         align-self:center}
 </style>
 </head>
 <body>
 <header>
   <div>
     <h1>genspark-signup</h1>
-    <div class="sub">setting diubah di sini → disimpan ke .env → signup.py jalan di belakang</div>
+    <div class="sub">setting disimpan ke .env, proses jalan di belakang layar</div>
   </div>
   <div class="row" style="margin-left:auto">
     <span id="status" class="badge idle">diam</span>
     <span class="badge" title="akun di akun.txt">akun.txt: <b id="cnt-akun">0</b></span>
     <span class="badge" title="proxy dari .env + proxy.txt">proxy: <b id="cnt-proxy">0</b></span>
+    <button id="btn-stop" class="danger sm" onclick="stopRun()" disabled>Stop</button>
   </div>
 </header>
 
+<nav>
+  <button data-tab="buat" class="on" onclick="showTab('buat')">Buat akun</button>
+  <button data-tab="dump" onclick="showTab('dump')">Dump akun</button>
+  <button data-tab="setting" onclick="showTab('setting')">Setting</button>
+  <button data-tab="hasil" onclick="showTab('hasil')">Hasil</button>
+</nav>
+
 <main>
-  <section>
-    <h2>Setting</h2>
-    <div class="row" style="margin-bottom:12px">
-      <button class="primary" id="btn-save" onclick="save()">Simpan setting</button>
-      <button id="btn-start" class="primary" onclick="startRun('signup')">Mulai</button>
-      <button id="btn-dump" onclick="startRun('dump')"
-              title="bikin akun tempmail, simpan yang creditnya lolos ambang (tanpa checkout)">Dump</button>
-      <button id="btn-credit" onclick="startRun('credit')">Cek credit</button>
-      <button id="btn-stop" class="danger" onclick="stopRun()" disabled>Stop</button>
-    </div>
-    <div id="flash"></div>
+  <!-- ============ Buat akun ============ -->
+  <div class="page on" id="page-buat">
+    <section>
+      <h2>Buat akun</h2>
+      <div class="desc">Signup + checkout Stripe + ambil API key.</div>
+      <div class="note"><b>Tab checkout akan terbuka</b> dan kartu diisi manual
+        di browser. Akun yang sudah selesai dilewati, yang sudah berbayar tak
+        ditagih dua kali.</div>
+      <div class="row">
+        <button class="primary" onclick="startRun('signup')"
+                data-run="1">Mulai buat akun</button>
+        <button onclick="startRun('credit')" data-run="1">Cek credit</button>
+      </div>
+      <div class="flash" id="flash-buat"></div>
+    </section>
+    <section>
+      <div id="ask" hidden></div>
+      <h2>Log</h2>
+      <div class="logbox" id="log"><span class="dim">belum ada proses dijalankan…</span></div>
+    </section>
+  </div>
 
-    <div id="cfg">
-      __FORM__
-    </div>
-  </section>
+  <!-- ============ Dump akun ============ -->
+  <div class="page" id="page-dump">
+    <section>
+      <h2>Dump akun</h2>
+      <div class="desc">Bikin akun dari tempmail, cek credit, simpan yang lolos ambang.</div>
+      <div class="note"><b>Tanpa checkout Stripe</b> — tak ada kartu dan tak ada
+        tagihan. Akun yang creditnya di bawah ambang tetap dilaporkan tapi tidak
+        disimpan. Butuh <b>EMAIL_SOURCE=emailnator</b> (atur di tab Setting).</div>
+      <div id="cfg-dump">__FORM_DUMP__</div>
+      <div class="row">
+        <button class="primary" onclick="startRun('dump')"
+                data-run="1">Mulai dump</button>
+      </div>
+      <div class="flash" id="flash-dump"></div>
+    </section>
+    <section>
+      <div id="ask-dump-slot"></div>
+      <h2>Log dump</h2>
+      <div class="logbox" id="log-dump"><span class="dim">belum ada proses dijalankan…</span></div>
+    </section>
+  </div>
 
-  <section>
-    <div id="ask" hidden></div>
-    <h2>Log</h2>
-    <div id="log"><span class="dim">belum ada proses dijalankan…</span></div>
-    <h2 style="margin-top:16px">Hasil (accounts.json)</h2>
-    <div id="accounts" class="empty">memuat…</div>
-  </section>
+  <!-- ============ Setting ============ -->
+  <div class="page solo" id="page-setting">
+    <section>
+      <h2>Setting</h2>
+      <div class="desc">Disimpan ke <code>.env</code>. Kosongkan field untuk memakai nilai default.</div>
+      <div class="row" style="margin-bottom:10px">
+        <button class="primary" onclick="save(true)">Simpan setting</button>
+      </div>
+      <div class="flash" id="flash-setting"></div>
+      <div id="cfg">__FORM__</div>
+    </section>
+  </div>
+
+  <!-- ============ Hasil ============ -->
+  <div class="page solo" id="page-hasil">
+    <section>
+      <h2>Hasil</h2>
+      <div class="desc">Isi <code>accounts.json</code> — diperbarui otomatis.</div>
+
+      <div class="filters">
+        <div class="f">
+          <span class="lab">Credit minimal</span>
+          <input type="number" id="f-cmin" placeholder="mis. 2000"
+                 oninput="applyFilter()">
+        </div>
+        <div class="f">
+          <span class="lab">Credit maksimal</span>
+          <input type="number" id="f-cmax" placeholder="tanpa batas"
+                 oninput="applyFilter()">
+        </div>
+        <div class="f">
+          <span class="lab">Dibuat</span>
+          <select id="f-time" onchange="applyFilter()">
+            <option value="">kapan saja</option>
+            <option value="1">24 jam terakhir</option>
+            <option value="7">7 hari terakhir</option>
+            <option value="30">30 hari terakhir</option>
+            <option value="custom">rentang sendiri…</option>
+          </select>
+        </div>
+        <div class="f" id="f-range" hidden>
+          <span class="lab">Dari — sampai</span>
+          <div class="row" style="gap:6px">
+            <input type="date" id="f-from" onchange="applyFilter()">
+            <input type="date" id="f-to" onchange="applyFilter()">
+          </div>
+        </div>
+        <div class="f">
+          <span class="lab">&nbsp;</span>
+          <button class="sm" onclick="resetFilter()">Reset</button>
+        </div>
+        <span class="tally" id="tally"></span>
+      </div>
+
+      <div class="row" style="margin-bottom:4px">
+        <button class="primary" onclick="copyAllKeys()">Copy semua API key</button>
+        <button onclick="copyAllKeys('csv')"
+                title="email,api_key,plan,credit per baris">Copy sebagai CSV</button>
+        <button class="sm" onclick="toggleAllKeys()" id="btn-reveal">Lihat semua key</button>
+      </div>
+      <div class="flash" id="flash-hasil"></div>
+      <div id="accounts" class="empty">memuat…</div>
+    </section>
+  </div>
 </main>
 
 <script>
@@ -510,15 +647,43 @@ async function jpost(url, body){
   return r.json();
 }
 
-function flash(msg,kind){const f=$('flash');f.textContent=msg;
-  f.className=kind||'';}
+let curTab='buat';
+
+function showTab(name){
+  curTab=name;
+  document.querySelectorAll('.page').forEach(p=>
+    p.classList.toggle('on', p.id==='page-'+name));
+  document.querySelectorAll('nav button').forEach(b=>
+    b.classList.toggle('on', b.dataset.tab===name));
+  // kotak tanya captcha/OTP ikut ke tab yang sedang dilihat, biar tak
+  // tersembunyi di tab lain saat proses menunggu jawaban
+  placeAsk();
+  try{ localStorage.setItem('tab', name); }catch(e){}
+}
+
+function placeAsk(){
+  const ask=$('ask');
+  const slot=curTab==='dump' ? $('ask-dump-slot') : null;
+  if(slot && ask.parentElement!==slot) slot.appendChild(ask);
+  if(!slot){
+    const home=$('page-buat').querySelector('section:last-child');
+    if(ask.parentElement!==home) home.insertBefore(ask, home.firstChild);
+  }
+}
+
+function flash(msg,kind){
+  const f=$('flash-'+curTab) || $('flash-buat');
+  if(!f) return;
+  f.textContent=msg; f.className='flash '+(kind||'');
+}
 
 async function loadState(){
   try{
     const s=await jget('/api/state');
     const cfg=s.settings;
-    document.querySelectorAll('#cfg [name]').forEach(el=>{
-      if(el.name in cfg) el.value=cfg[el.name]??'';
+    document.querySelectorAll('#cfg [name], #cfg-dump [name]').forEach(el=>{
+      if(el.name in cfg && el!==document.activeElement)
+        el.value=cfg[el.name]??'';
     });
     $('cnt-akun').textContent=s.akun_lines;
     $('cnt-proxy').textContent=s.proxy_lines;
@@ -536,12 +701,15 @@ function toggleEye(key){
   btn.querySelector('.ec').hidden=!show;
 }
 
+const MODE_LABEL={signup:'buat akun', dump:'dump', credit:'cek credit'};
+
 function renderRun(s){
   const st=$('status'), sp=$('btn-stop');
-  const runBtns=[$('btn-start'), $('btn-dump'), $('btn-credit')];
+  const runBtns=document.querySelectorAll('[data-run]');
   if(s.running){
-    st.textContent='berjalan ('+s.mode+' pid '+s.pid+')';
+    st.textContent=(MODE_LABEL[s.mode]||s.mode)+' berjalan · pid '+s.pid;
     st.className='badge run';
+    if(s.mode) logMode=s.mode;   // reload halaman: arahkan log ke panel benar
     runBtns.forEach(b=>b.disabled=true); sp.disabled=false;
   }else{
     st.textContent='diam'; st.className='badge idle';
@@ -549,28 +717,162 @@ function renderRun(s){
   }
 }
 
-function renderAccounts(acc, running){
-  const el=$('accounts');
-  const rows=Object.entries(acc||{}).sort((a,b)=>
-    (b[1].created_at||'').localeCompare(a[1].created_at||''));
-  if(!rows.length){el.innerHTML='<div class="empty">belum ada akun.</div>';return;}
+const ICON_COPY='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '+
+  'stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="12" height="12" rx="2"/>'+
+  '<path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+const ICON_EYE='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '+
+  'stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7'+
+  '-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+let ACC={};              // accounts terakhir dari server
+let RUNNING=false;
+let showKeys=false;      // "Lihat semua key" ditekan?
+
+// accounts.json menyimpan created_at sebagai "YYYY-MM-DD HH:MM:SS" waktu lokal
+function parseTs(s){
+  if(!s) return null;
+  const d=new Date(String(s).replace(' ','T'));
+  return isNaN(d) ? null : d;
+}
+
+function filtered(){
+  const cmin=$('f-cmin').value.trim(), cmax=$('f-cmax').value.trim();
+  const mode=$('f-time').value;
+  const lo=cmin===''?null:Number(cmin), hi=cmax===''?null:Number(cmax);
+  let from=null, to=null;
+  if(mode==='custom'){
+    if($('f-from').value) from=new Date($('f-from').value+'T00:00:00');
+    if($('f-to').value)   to  =new Date($('f-to').value+'T23:59:59');
+  }else if(mode){
+    from=new Date(Date.now()-Number(mode)*864e5);
+  }
+  return Object.entries(ACC).filter(([email,v])=>{
+    const c=Number(v.credit);
+    if(lo!==null && !(c>=lo)) return false;
+    if(hi!==null && !(c<=hi)) return false;
+    if(from||to){
+      const t=parseTs(v.created_at);
+      if(!t) return false;                       // tanpa tanggal -> tak lolos
+      if(from && t<from) return false;
+      if(to && t>to) return false;
+    }
+    return true;
+  }).sort((a,b)=>(b[1].created_at||'').localeCompare(a[1].created_at||''));
+}
+
+function applyFilter(){
+  $('f-range').hidden = $('f-time').value!=='custom';
+  renderRows();
+}
+
+function resetFilter(){
+  ['f-cmin','f-cmax','f-from','f-to'].forEach(k=>$(k).value='');
+  $('f-time').value='';
+  applyFilter();
+}
+
+function toggleAllKeys(){
+  showKeys=!showKeys;
+  $('btn-reveal').textContent=showKeys?'Sembunyikan key':'Lihat semua key';
+  renderRows();
+}
+
+function renderRows(){
+  const el=$('accounts'), rows=filtered();
+  const total=Object.keys(ACC).length;
+  $('tally').textContent=total
+    ? rows.length+' dari '+total+' akun'+
+      (rows.length?' · total credit '+rows.reduce(
+        (s,[,v])=>s+(Number(v.credit)||0),0).toLocaleString('id-ID'):'')
+    : '';
+  if(!total){el.innerHTML='<div class="empty">belum ada akun.</div>';return;}
+  if(!rows.length){
+    el.innerHTML='<div class="empty">tak ada akun yang cocok dengan filter.</div>';
+    return;}
   let html='<table><thead><tr><th>email</th><th>plan</th><th>credit</th>'+
     '<th>api_key</th><th>bayar</th><th>dibuat</th><th></th></tr></thead><tbody>';
   for(const [email,v] of rows){
-    const key=(v.api_key||'').slice(0,14)+(v.api_key?'…':'');
+    const full=v.api_key||'';
+    const shown=showKeys?full:(full?full.slice(0,16)+'…':'');
     html+='<tr><td>'+esc(email)+'</td>'+
       '<td class="plan-badge">'+esc(v.plan||'')+'</td>'+
       '<td>'+esc(String(v.credit??''))+'</td>'+
-      '<td>'+esc(key)+'</td>'+
+      '<td><div class="keycell">'+
+        '<span class="keytext'+(showKeys?' show':'')+'" data-full="'+esc(full)+'">'+
+          esc(shown)+'</span>'+
+        (full?'<button type="button" class="iconbtn btn-eye" title="lihat/sembunyikan">'
+              +ICON_EYE+'</button>'+
+              '<button type="button" class="iconbtn btn-copy" data-key="'+esc(full)+
+              '" title="copy API key">'+ICON_COPY+'</button>':'')+
+      '</div></td>'+
       '<td>'+esc(v.payment_status||'')+'</td>'+
-      '<td>'+esc((v.created_at||'').slice(5,16))+'</td>'+
-      '<td><button type="button" class="danger btn-del" data-email="'+esc(email)+
-      '"'+(running?' disabled':'')+'>Hapus</button></td></tr>';
+      '<td>'+esc(v.created_at||'')+'</td>'+
+      '<td><button type="button" class="danger sm btn-del" data-email="'+esc(email)+
+      '"'+(RUNNING?' disabled':'')+'>Hapus</button></td></tr>';
   }
   el.innerHTML=html+'</tbody></table>';
 }
 
+let lastAccJson='';
+
+function renderAccounts(acc, running){
+  ACC=acc||{}; RUNNING=!!running;
+  // polling tiap 2.5s: kalau isinya sama, JANGAN bangun ulang tabel --
+  // itu akan menutup kembali key yang baru dibuka/di-scroll pengguna
+  const sig=JSON.stringify(acc)+'|'+running;
+  if(sig===lastAccJson) return;
+  lastAccJson=sig;
+  renderRows();
+}
+
+async function copyText(text){
+  try{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }catch(e){
+    // clipboard API butuh origin aman/izin -- fallback textarea+execCommand
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      const ok=document.execCommand('copy');
+      ta.remove();
+      return ok;
+    }catch(e2){ return false; }
+  }
+}
+
+async function copyAllKeys(fmt){
+  const rows=filtered().filter(([,v])=>v.api_key);
+  if(!rows.length){flash('tak ada API key untuk dicopy','err');return;}
+  const text = fmt==='csv'
+    ? 'email,api_key,plan,credit\n'+rows.map(([e,v])=>
+        [e, v.api_key, v.plan||'', v.credit??''].join(',')).join('\n')
+    : rows.map(([,v])=>v.api_key).join('\n');
+  const ok=await copyText(text);
+  flash(ok ? rows.length+' API key dicopy'+(fmt==='csv'?' (CSV)':'')
+           : 'gagal copy — browser menolak akses clipboard',
+        ok?'ok':'err');
+}
+
 document.addEventListener('click', async (ev)=>{
+  // copy satu API key
+  const cp=ev.target.closest('.btn-copy');
+  if(cp){
+    const ok=await copyText(cp.dataset.key);
+    flash(ok?'API key dicopy':'gagal copy — browser menolak akses clipboard',
+          ok?'ok':'err');
+    return;
+  }
+  // lihat/sembunyikan satu API key
+  const ey=ev.target.closest('.btn-eye');
+  if(ey){
+    const span=ey.parentElement.querySelector('.keytext');
+    const full=span.dataset.full;
+    const open=span.classList.toggle('show');
+    span.textContent=open?full:(full.slice(0,16)+'…');
+    return;
+  }
   const btn=ev.target.closest('.btn-del');
   if(!btn) return;
   const email=btn.dataset.email;
@@ -581,34 +883,41 @@ document.addEventListener('click', async (ev)=>{
   loadState();
 });
 
-async function save(){
+async function save(loud){
   const data=new URLSearchParams();
-  document.querySelectorAll('#cfg [name]').forEach(el=>
+  // kirim SEMUA field dari kedua form: server menghapus kunci yang dikirim
+  // kosong, jadi mengirim sebagian saja akan menghapus setting tab lain
+  document.querySelectorAll('#cfg [name], #cfg-dump [name]').forEach(el=>
     data.append(el.name, el.value));
   const j=await jpost('/api/save', data);
-  flash(j.ok?'setting tersimpan':'gagal: '+(j.error||''), j.ok?'ok':'err');
+  if(loud || !j.ok)
+    flash(j.ok?'setting tersimpan':'gagal: '+(j.error||''), j.ok?'ok':'err');
   return j.ok;
 }
 
 async function startRun(mode){
-  const ok=await save(); if(!ok) return;
+  const ok=await save(false); if(!ok) return;
   const j=await jpost('/api/start?mode='+mode);
   if(!j.ok){flash(j.error||'gagal mulai','err'); return;}
-  const msg={credit:'mulai cek credit…', dump:'mulai dump akun…'}[mode]
-            || 'mulai signup…';
-  flash(msg,'ok');
+  logMode=mode;
+  const box=$(mode==='dump'?'log-dump':'log');
+  box.innerHTML='';                       // log baru, jangan tumpuk yang lama
+  lastSeq=0;                              // proses baru -> seq server juga reset
+  flash('mulai '+(MODE_LABEL[mode]||mode)+'…','ok');
 }
 
 async function stopRun(){
   await jpost('/api/stop'); flash('diminta berhenti…');
 }
 
+let logMode='signup';       // log dump masuk panel dump, sisanya panel utama
+
 async function pollLog(){
   while(true){
     try{
       const d=await jget('/api/log?after='+lastSeq);
       if(d.lines && d.lines.length){
-        const log=$('log');
+        const log=$(logMode==='dump'?'log-dump':'log');
         for(const t of d.lines){
           const div=document.createElement('div');
           div.textContent=t; log.appendChild(div);
@@ -675,6 +984,12 @@ async function pollPending(){
   }
 }
 
+// tab terakhir diingat, biar refresh tak selalu balik ke tab pertama
+try{
+  const t=localStorage.getItem('tab');
+  if(t && $('page-'+t)) showTab(t);
+}catch(e){}
+
 loadState();
 pollLog();
 pollState();
@@ -686,17 +1001,17 @@ pollPending();
 
 
 def render_page():
-    form = ""
-    for group, fields in GROUPS:
-        items = []
-        for key, ftype, label, opts, hint in fields:
-            cls = " full" if ftype == "textarea" else ""
-            items.append('<div class="field' + cls + '">'
-                         + field_html(key, ftype, label, opts, hint)
-                         + '</div>')
-        items = "".join(items)
-        form += f"<fieldset><legend>{group}</legend><div class=\"grid\">{items}</div></fieldset>"
-    return PAGE.replace("__FORM__", form)
+    """Bangun dua form: setting umum (tab Setting) dan aturan dump (tab Dump)."""
+    forms = {"setting": "", "dump": ""}
+    for group, tab, fields in GROUPS:
+        items = "".join(
+            '<div class="field' + (" full" if ftype == "textarea" else "") + '">'
+            + field_html(key, ftype, label, opts, hint) + '</div>'
+            for key, ftype, label, opts, hint in fields)
+        forms[tab] += (f'<fieldset><legend>{group}</legend>'
+                       f'<div class="grid">{items}</div></fieldset>')
+    return (PAGE.replace("__FORM__", forms["setting"])
+                .replace("__FORM_DUMP__", forms["dump"]))
 
 
 # --------------------------------------------------------------------------
