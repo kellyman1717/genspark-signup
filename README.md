@@ -86,9 +86,10 @@ dijawab dari browser: gambarnya muncul di halaman, jawabannya diteruskan ke
 proses yang sedang menunggu.
 
 Tab **Hasil** bisa menyegarkan credit langsung: tombol putar per baris untuk
-satu akun, atau **Refresh credit terpilih** / **Refresh semua credit**. Hanya
-akun yang disegarkan yang ditimpa, jadi nilai akun lain tak hilang, dan waktu
-cek terakhir dicatat per akun.
+satu akun, atau **Refresh credit terpilih** / **Refresh semua credit**. Lognya
+tampil di halaman itu sendiri, jadi tak perlu pindah tab. Hanya akun yang
+disegarkan yang ditimpa, jadi nilai akun lain tak hilang, dan waktu cek
+terakhir dicatat per akun.
 
 Argumen: `py webui.py 9000` (ganti port), `py webui.py --no-browser` (jangan
 buka tab otomatis). Port default bisa juga diset lewat env `WEBUI_PORT`.

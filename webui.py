@@ -672,6 +672,13 @@ PAGE = r"""<!doctype html>
           Refresh semua credit</button>
         <span class="hint" id="ref-note"></span>
       </div>
+      <div id="ref-log-wrap" hidden style="margin-bottom:12px">
+        <div class="row" style="justify-content:space-between">
+          <span class="lab">Log refresh</span>
+          <button class="sm" onclick="$('ref-log').innerHTML=''">Bersihkan</button>
+        </div>
+        <div class="logbox" id="ref-log" style="height:22vh;min-height:120px"></div>
+      </div>
       <div class="flash" id="flash-hasil"></div>
       <div id="accounts" class="empty">memuat…</div>
     </section>
@@ -753,11 +760,16 @@ function renderRun(s){
   if(s.running){
     st.textContent=(MODE_LABEL[s.mode]||s.mode)+' berjalan · pid '+s.pid;
     st.className='badge run';
-    if(s.mode) logMode=s.mode;   // reload halaman: arahkan log ke panel benar
+    // Reload halaman: arahkan log ke panel yang benar. JANGAN timpa penanda
+    // 'refresh' -- mode di server tetap "credit" untuk refresh dari tab Hasil,
+    // dan menimpanya akan memindahkan log ke panel lain di tengah jalan.
+    if(s.mode && !(logMode==='refresh' && s.mode==='credit')) logMode=s.mode;
     runBtns.forEach(b=>b.disabled=true); sp.disabled=false;
   }else{
     st.textContent='diam'; st.className='badge idle';
     runBtns.forEach(b=>b.disabled=false); sp.disabled=true;
+    const rn=$('ref-note');
+    if(rn && rn.textContent.includes('berjalan')) rn.textContent='';
   }
 }
 
@@ -962,8 +974,10 @@ async function refreshCredit(scope, one){
   const j=await jpost('/api/refresh-credit', data);
   if(!j.ok){flash(j.error||'gagal mulai refresh','err'); return;}
   // refresh jalan sebagai proses `signup.py credit` -> lognya ke panel utama
-  logMode='credit'; lastSeq=0; $('log').innerHTML='';
-  $('ref-note').textContent='refresh '+n+' akun berjalan… lihat tab Buat akun untuk lognya';
+  // 'refresh' = mode credit yang dipicu dari tab Hasil; lognya tetap di sini
+  logMode='refresh'; lastSeq=0;
+  $('ref-log').innerHTML=''; $('ref-log-wrap').hidden=false;
+  $('ref-note').textContent='refresh '+n+' akun berjalan…';
   flash('refresh credit '+n+' akun dimulai (login tiap akun, butuh beberapa detik)','ok');
 }
 
@@ -1071,7 +1085,7 @@ async function pollLog(){
     try{
       const d=await jget('/api/log?after='+lastSeq);
       if(d.lines && d.lines.length){
-        const log=$(logMode==='dump'?'log-dump':'log');
+        const log=$({dump:'log-dump', refresh:'ref-log'}[logMode] || 'log');
         for(const t of d.lines){
           const div=document.createElement('div');
           div.textContent=t; log.appendChild(div);
