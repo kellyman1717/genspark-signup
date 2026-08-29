@@ -70,12 +70,22 @@ MAIL_TIMEOUT = max(int(ENV.get("MAIL_TIMEOUT", "30")), 20)
 # password nyata tak pernah ikut tersimpan di dalam kode.
 PASSWORD = ENV.get("PASSWORD", "")
 SAMPLE_PASSWORD = "GantiIni@2026"  # hanya untuk pesan bantuan
+# Diset webui.py pada subprocess-nya. Saat aktif, captcha/OTP manual dikirim
+# lewat marker JSON di stdout (dibaca webui.py) bukan gambar/prompt terminal.
+WEBUI = os.environ.get("GENSPARK_WEBUI") == "1"
 IO_LOCK = threading.Lock()   # accounts.json + stdout
 TAB_LOCK = threading.Lock()  # buka tab Stripe satu-satu
 # detik jeda antar tab checkout; kartu diisi manusia, jangan diserbu
 TAB_DELAY = float(ENV.get("TAB_DELAY", "3"))
 # saldo akun gratis. Credit di atas ini berarti kuota langganan sudah masuk.
 FREE_CREDIT = int(ENV.get("FREE_CREDIT", "200"))
+
+# ---- mode dump (py signup.py dump) ----
+# Bikin akun dari tempmail, cek credit, SIMPAN yang creditnya lolos ambang.
+# Tanpa checkout Stripe: tak ada kartu, tak ada tagihan.
+DUMP_MIN_CREDIT = int(ENV.get("DUMP_MIN_CREDIT", "2000"))  # ambang simpan
+DUMP_TARGET = int(ENV.get("DUMP_TARGET", "1"))    # berapa akun bagus dicari
+DUMP_MAX_TRIES = int(ENV.get("DUMP_MAX_TRIES", "10"))  # batas percobaan
 
 # Tier dari HAR /api/payment/sub2/tier_config. Ganti TIER_ID untuk paket lain.
 TIER_ID = "plus1"
@@ -504,10 +514,17 @@ def solve_captcha(c, email):
                 continue
             log(f"  [{email}] captcha[{CAPTCHA_PROVIDER}] percobaan {n}: {ans}")
         else:
-            cap = f"captcha_{email.split('@')[0][:12]}.png"
-            save_image(img, cap)
-            show_image(cap)
-            ans = input(f"[{email}] Captcha: ").strip()
+            if WEBUI:
+                log(f"__WEBUI_ASK__ {json.dumps({'kind': 'captcha', 'email': email, 'image': img})}")
+            else:
+                cap = f"captcha_{email.split('@')[0][:12]}.png"
+                save_image(img, cap)
+                show_image(cap)
+            # input(prompt) menulis prompt ke stdout tanpa newline kalau stdout
+            # bukan tty (kasus WebUI: pipe) -- teksnya bisa nempel ke baris log
+            # berikutnya. Marker di atas sudah membawa info yang sama, jadi
+            # kosongkan prompt saat WEBUI.
+            ans = input("" if WEBUI else f"[{email}] Captcha: ").strip()
             if not ans:
                 raise RuntimeError("captcha kosong")
         if c.verify_captcha(ans):
@@ -520,7 +537,9 @@ def solve_captcha(c, email):
 def get_otp(email, proxy=None):
     """Emailnator -> baca inbox otomatis. Selain itu -> ketik manual."""
     if EMAIL_SOURCE.lower() != "emailnator":
-        otp = input(f"[{email}] Kode OTP: ").strip()
+        if WEBUI:
+            log(f"__WEBUI_ASK__ {json.dumps({'kind': 'otp', 'email': email})}")
+        otp = input("" if WEBUI else f"[{email}] Kode OTP: ").strip()
         if not otp:
             raise RuntimeError("otp kosong")
         return otp
@@ -749,6 +768,95 @@ def main():
             print(f"  GAGAL {e}: {failed.get(e, 'tidak diproses')}")
 
 
+def dump_one(accounts):
+    """Satu putaran dump: bikin akun tempmail baru -> cek credit -> simpan
+    kalau lolos ambang. Return (email, credit, plan, disimpan?).
+
+    Tanpa checkout: tak ada kartu dan tak ada tagihan. Akun yang creditnya
+    di bawah ambang tetap dilaporkan (biar distribusinya kelihatan) tapi
+    tidak masuk accounts.json.
+    """
+    em = fresh_email(
+        mailer.Emailnator(proxy=PROXY_POOL.next(), timeout=MAIL_TIMEOUT),
+        used_inboxes())
+    record_emails([em])          # catat biar tak dipakai ulang lain kali
+    log(f"  [{em}] bikin akun...")
+    used, c, cogen = interactive_signup(em)
+
+    plan = cogen.get("plan", "free")
+    credit = c.credit_balance()
+    log(f"  [{used}] plan={plan} credit={credit} (ambang {DUMP_MIN_CREDIT})")
+    if credit < DUMP_MIN_CREDIT:
+        return used, credit, plan, False
+
+    key_name = f"gk-{int(time.time() * 1000)}"
+    token = c.create_api_key(key_name)
+    accounts[used] = {
+        "email": cogen["email"],
+        "cogen_id": cogen["id"],
+        "api_key": token,
+        "key_name": key_name,
+        "payment_status": "none",   # dump: tak lewat checkout
+        "plan": plan,
+        "credit": credit,
+        "proxy": c.proxy or "direct",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_accounts(accounts)
+    log(f"  [{used}] DISIMPAN credit={credit} api_key={token[:24]}...")
+    return used, credit, plan, True
+
+
+def dump_mode():
+    """py signup.py dump -> bikin akun tempmail sampai dapat DUMP_TARGET akun
+    dengan credit >= DUMP_MIN_CREDIT, maksimal DUMP_MAX_TRIES percobaan."""
+    if not PASSWORD:
+        print("PASSWORD kosong. Isi di .env, mis. PASSWORD="
+              + repr(SAMPLE_PASSWORD)[1:-1])
+        return
+    if EMAIL_SOURCE.lower() != "emailnator":
+        print("mode dump butuh EMAIL_SOURCE=emailnator (alamat dibuat otomatis).")
+        return
+
+    prov = (CAPTCHA_PROVIDER or "manual").lower()
+    print(f"== dump: cari {DUMP_TARGET} akun dengan credit >= {DUMP_MIN_CREDIT} "
+          f"(maks {DUMP_MAX_TRIES} percobaan) ==")
+    print(f"captcha: {prov}"
+          + ("" if prov == "manual" else f" (saldo dicek saat dipakai)"))
+    print("tanpa checkout Stripe: tak ada kartu, tak ada tagihan.")
+    print()
+
+    accounts = load_accounts()
+    saved, rows = [], []
+    for n in range(1, DUMP_MAX_TRIES + 1):
+        if len(saved) >= DUMP_TARGET:
+            break
+        print(f"-- percobaan {n}/{DUMP_MAX_TRIES} "
+              f"(terkumpul {len(saved)}/{DUMP_TARGET}) --")
+        try:
+            email, credit, plan, keep = dump_one(accounts)
+            rows.append((email, credit, plan, keep))
+            if keep:
+                saved.append(email)
+        except Exception as ex:
+            log(f"  GAGAL: {ex}")
+            rows.append(("?", -1, "?", False))
+
+    print()
+    print("=== HASIL DUMP ===")
+    for email, credit, plan, keep in rows:
+        tag = "SIMPAN" if keep else "buang "
+        print(f"  {tag} {email}: plan={plan} credit={credit}")
+    print()
+    print(f"tersimpan {len(saved)} akun (ambang credit {DUMP_MIN_CREDIT}), "
+          f"{len(rows)} percobaan")
+    if not saved and rows:
+        best = max((c for _, c, _, _ in rows), default=-1)
+        print(f"credit tertinggi yang didapat: {best}. Kalau semua akun baru "
+              f"memang di bawah {DUMP_MIN_CREDIT}, turunkan DUMP_MIN_CREDIT "
+              "di .env.")
+
+
 def check_credits():
     """py signup.py credit -> login tiap akun di accounts.json, cetak sisa credit."""
     accounts = load_accounts()
@@ -799,7 +907,10 @@ def check_credits():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("credit", "credits", "saldo"):
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg in ("credit", "credits", "saldo"):
         check_credits()
+    elif arg == "dump":
+        dump_mode()
     else:
         main()

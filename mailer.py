@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Emailnator temp-mail: generate alamat + baca OTP otomatis.
 
-API (dari HAR www.emailnator.com.har):
-  GET  /                -> set cookie XSRF-TOKEN + gmailnator_session
-  POST /generate-email  {"email":["dotGmail"]}          -> {"email":["x@gmail.com"]}
-  POST /message-list    {"email":"x@gmail.com"}         -> {"messageData":[{messageID,from,subject,time}]}
-  POST /message-list    {"email":"...","messageID":"."} -> isi email (HTML)
+Emailnator ditulis ulang jadi aplikasi Next.js (2026); API lama (XSRF-TOKEN +
+`/generate-email` dengan body `{"email":["dotGmail"]}`) sudah tak dipakai.
+API baru, tanpa cookie XSRF:
 
-Token XSRF dikirim sebagai header X-XSRF-TOKEN (URL-decoded dari cookie).
+  POST /api/generate-email  {"ids":[3]}                     -> {"status":"success","email":"x@gmail.com",...}
+  POST /api/message-list     {"email":"x@gmail.com","limit":20} -> {"status":"success","messages":[{id,from,subject,timestamp,time_ago}]}
+  GET  /api/message/<id>                                    -> {"content":"<html>...","from":...,"subject":...}
+
+Tipe alamat berupa id numerik: domain=1, plusGmail=2, dotGmail=3, googleMail=8.
 """
 import json, re, time, urllib.parse, urllib.request, urllib.error
 import http.cookiejar
@@ -19,8 +21,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
 # Jenis alamat: dotGmail (titik acak, inbox Gmail asli) | plusGmail | googleMail | domain
+ETYPE = {"domain": 1, "plusGmail": 2, "dotGmail": 3, "googleMail": 8}
 KIND = "dotGmail"
-ADS = {"ADSVPN"}  # messageID iklan bawaan emailnator, bukan email nyata
+ADS = {"ADSVPN"}  # id iklan bawaan emailnator, bukan email nyata
 HEARTBEAT = 30    # detik: seberapa sering kabari kalau OTP belum datang
 
 
@@ -29,31 +32,23 @@ class Emailnator:
         self.kind = kind
         self.timeout = timeout
         self.jar = http.cookiejar.CookieJar()
-        # token XSRF diikat ke sesi, jadi satu proxy dipegang sepanjang hidup objek
+        # API baru tak butuh cookie/CSRF, tapi cookie tetap dipertahankan
+        # seandainya cloudflare ikut menyetel sesuatu. Satu proxy dipegang
+        # sepanjang hidup objek supaya sesinya konsisten.
         self.proxy = proxy
         self.opener = proxies.build_opener(
             proxy, urllib.request.HTTPCookieProcessor(self.jar))
-        self.token = None
 
-    def _bootstrap(self):
-        r = urllib.request.Request(HOST + "/", headers={"User-Agent": UA})
-        with self.opener.open(r, timeout=self.timeout) as resp:
-            resp.read()
-        self.token = next((urllib.parse.unquote(c.value)
-                           for c in self.jar if c.name == "XSRF-TOKEN"), None)
-        if not self.token:
-            raise RuntimeError("XSRF-TOKEN tak ada; emailnator berubah?")
+    def _json_body(self, payload):
+        return json.dumps(payload).encode()
 
     def _post(self, path, payload):
-        if not self.token:
-            self._bootstrap()
         r = urllib.request.Request(
-            HOST + path, data=json.dumps(payload).encode(),
+            HOST + path, data=self._json_body(payload),
             headers={
                 "User-Agent": UA,
                 "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
-                "X-XSRF-TOKEN": self.token,
+                "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
                 "Origin": HOST,
                 "Referer": HOST + "/",
@@ -63,23 +58,53 @@ class Emailnator:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return raw  # /message-list dengan messageID balas HTML
+            return raw
+
+    def _get(self, path):
+        r = urllib.request.Request(
+            HOST + path,
+            headers={"User-Agent": UA, "Accept": "application/json"})
+        with self.opener.open(r, timeout=self.timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
 
     def new_email(self):
-        j = self._post("/generate-email", {"email": [self.kind]})
-        got = (j or {}).get("email") or []
+        kind_id = ETYPE.get(self.kind)
+        payload = {"ids": [kind_id]} if kind_id is not None else {"email": [self.kind]}
+        j = self._post("/api/generate-email", payload)
+        got = (j or {}).get("email")
         if not got:
             raise RuntimeError(f"generate-email kosong: {j}")
-        return got[0]
+        return got
 
     def messages(self, email):
-        j = self._post("/message-list", {"email": email})
-        return [m for m in (j or {}).get("messageData", [])
-                if m.get("messageID") not in ADS]
+        j = self._post("/api/message-list", {"email": email, "limit": 20})
+        out = []
+        for m in (j or {}).get("messages", []):
+            mid = m.get("id")
+            if mid in ADS:
+                continue
+            # wait_otp() dan sisanya memakai kunci lama: messageID/from/subject
+            out.append({"messageID": mid,
+                        "from": m.get("from", ""),
+                        "subject": m.get("subject", "")})
+        return out
 
     def body(self, email, message_id):
-        r = self._post("/message-list", {"email": email, "messageID": message_id})
-        return r if isinstance(r, str) else json.dumps(r)
+        bare = message_id.split("?", 1)[0]
+        j = self._get("/api/message/" + urllib.parse.quote(bare, safe=""))
+        if isinstance(j, str):
+            return j
+        content = (j or {}).get("content")
+        if content is not None:
+            return content
+        # tak ada "content" -> tampilkan apa adanya supaya OTP tetap bisa dibaca
+        plain = " ".join(str(v) for k, v in (j or {}).items()
+                         if k in ("from", "subject"))
+        return plain + " " + json.dumps(j)
 
 
 def extract_otp(text, digits=6):

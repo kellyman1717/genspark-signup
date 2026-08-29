@@ -38,9 +38,42 @@ Jalankan:
 
 ```bat
 py signup.py           :: proses akun
+py signup.py dump      :: bikin akun tempmail, simpan yang creditnya lolos ambang
 py signup.py credit    :: cek sisa credit tiap akun
 py test_har.py         :: self-check
+py webui.py            :: WebUI — satu perintah, atur setting & jalankan dari browser
 ```
+
+### Mode dump
+
+`py signup.py dump` (atau tombol **Dump** di WebUI) bikin akun dari alamat
+tempmail, cek plan + credit-nya, lalu **simpan hanya yang creditnya memenuhi
+ambang**. Alurnya: signup → email → password → cek credit & plan → simpan
+kalau lolos. Tanpa checkout Stripe sama sekali: tak ada kartu, tak ada
+tagihan. Akun yang creditnya di bawah ambang tetap dilaporkan (biar
+distribusinya kelihatan) tapi tidak masuk `accounts.json`.
+
+Diatur lewat `.env` atau form WebUI:
+
+```ini
+DUMP_MIN_CREDIT=2000   ; simpan kalau credit >= ini
+DUMP_TARGET=1          ; berhenti setelah dapat sebanyak ini
+DUMP_MAX_TRIES=10      ; batas percobaan (tiap percobaan pakai captcha)
+```
+
+Butuh `EMAIL_SOURCE=emailnator`. Akun yang lolos tetap dibuatkan API key,
+jadi langsung terbaca `py signup.py credit`.
+
+### WebUI
+
+`py webui.py` membuka `http://127.0.0.1:8765` di browser. Setting diubah lewat
+form dan disimpan ke `.env`; tombol **Mulai** / **Cek credit** menjalankan
+`signup.py` di belakang layar, log ditayangkan langsung, dan hasil terbaca dari
+`accounts.json`. Hanya stdlib, tanpa install. Mode captcha/OTP manual belum
+didukung di WebUI — pakai provider otomatis + `EMAIL_SOURCE=emailnator`.
+
+Argumen: `py webui.py 9000` (ganti port), `py webui.py --no-browser` (jangan
+buka tab otomatis). Port default bisa juga diset lewat env `WEBUI_PORT`.
 
 ## Alur
 

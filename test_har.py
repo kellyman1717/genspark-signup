@@ -289,11 +289,24 @@ def test_mail_timeout_separate():
     importlib.reload(signup)
     assert signup.MAIL_TIMEOUT == 45
 
-    # tiap pemakaian Emailnator harus lewat MAIL_TIMEOUT, bukan TIMEOUT
+    # tiap pemakaian Emailnator harus lewat MAIL_TIMEOUT, bukan TIMEOUT.
+    # Dicek relatif (bukan jumlah tetap) supaya menambah pemakaian Emailnator
+    # baru tak memalsukan kegagalan -- yang penting TAK ADA yang pakai TIMEOUT.
     src = inspect.getsource(signup)
-    assert "Emailnator(proxy=proxy, timeout=TIMEOUT)" not in src
-    assert "Emailnator(proxy=PROXY_POOL.next(), timeout=TIMEOUT)" not in src
-    assert src.count("timeout=MAIL_TIMEOUT") == 3, src.count("timeout=MAIL_TIMEOUT")
+    # ambil argumen tiap pemanggilan dengan menghitung tanda kurung, supaya
+    # PROXY_POOL.next() di dalamnya tak memotong pencocokan
+    uses = []
+    for m in re.finditer(r"Emailnator\(", src):
+        depth, i = 1, m.end()
+        while i < len(src) and depth:
+            depth += (src[i] == "(") - (src[i] == ")")
+            i += 1
+        uses.append(src[m.end():i - 1])
+    assert uses, "tak ada pemakaian Emailnator?"
+    for u in uses:
+        assert "timeout=MAIL_TIMEOUT" in u, u
+    assert src.count("timeout=MAIL_TIMEOUT") == len(uses), \
+        f"{src.count('timeout=MAIL_TIMEOUT')} != {len(uses)}"
 
     for k in ("TIMEOUT", "MAIL_TIMEOUT"):
         _os.environ.pop(k, None)
