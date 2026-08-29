@@ -906,12 +906,27 @@ def dump_mode():
               "di .env.")
 
 
-def check_credits():
-    """py signup.py credit -> login tiap akun di accounts.json, cetak sisa credit."""
+def check_credits(only=None):
+    """py signup.py credit [email ...] -> login tiap akun di accounts.json,
+    cetak sisa credit, dan simpan hasilnya kembali.
+
+    only = daftar email yang mau disegarkan saja. Kosong/None -> semua.
+    Akun yang tak disegarkan TIDAK disentuh, jadi nilainya tak hilang.
+    """
     accounts = load_accounts()
     if not accounts:
         print("accounts.json kosong")
         return
+    if only:
+        target = {e: r for e, r in accounts.items() if e in set(only)}
+        tak_ada = [e for e in only if e not in accounts]
+        for e in tak_ada:
+            print(f"  ? {e}: tak ada di accounts.json, dilewati")
+        if not target:
+            print("tak ada akun yang cocok untuk disegarkan")
+            return
+    else:
+        target = accounts
 
     def one(email, rec):
         c = Client()
@@ -926,12 +941,12 @@ def check_credits():
             "period_end": u.get("personal_membership_ext", {}).get("current_period_end"),
         }, None
 
-    print(f"cek {len(accounts)} akun...")
+    print(f"cek {len(target)} akun...")
     print()
-    rows, total = [], 0
+    rows, total, fresh = [], 0, {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         for fut in as_completed([pool.submit(one, e, r)
-                                 for e, r in accounts.items()]):
+                                 for e, r in target.items()]):
             try:
                 email, info, err = fut.result()
             except Exception as ex:
@@ -940,9 +955,18 @@ def check_credits():
             rows.append((email, info, err))
             if info:
                 total += max(info["credit"], 0)
-                accounts[email]["credit"] = info["credit"]
-                accounts[email]["plan"] = info["plan"]
-    save_accounts(accounts)
+                fresh[email] = info
+
+    # Muat ulang dari disk sebelum menulis: WebUI bisa menghapus akun sambil
+    # refresh berjalan, dan menyimpan salinan lama akan menghidupkannya lagi.
+    # Yang ditimpa hanya akun yang benar-benar disegarkan.
+    latest = load_accounts()
+    for email, info in fresh.items():
+        if email in latest:
+            latest[email]["credit"] = info["credit"]
+            latest[email]["plan"] = info["plan"]
+            latest[email]["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_accounts(latest)
 
     for email, info, err in sorted(rows, key=lambda r: r[0]):
         if err:
@@ -958,7 +982,8 @@ def check_credits():
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg in ("credit", "credits", "saldo"):
-        check_credits()
+        # argumen sisanya = email tertentu saja; kosong -> semua akun
+        check_credits(sys.argv[2:] or None)
     elif arg == "dump":
         dump_mode()
     else:

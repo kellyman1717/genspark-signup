@@ -40,6 +40,7 @@ Jalankan:
 py signup.py           :: proses akun
 py signup.py dump      :: bikin akun tempmail, simpan yang creditnya lolos ambang
 py signup.py credit    :: cek sisa credit tiap akun
+py signup.py credit a@gmail.com b@gmail.com   :: cek akun tertentu saja
 py test_har.py         :: self-check
 py webui.py            :: WebUI — satu perintah, atur setting & jalankan dari browser
 ```
@@ -80,8 +81,14 @@ gratis) dan akun bagus ikut terbuang.
 `py webui.py` membuka `http://127.0.0.1:8765` di browser. Setting diubah lewat
 form dan disimpan ke `.env`; tombol **Mulai** / **Cek credit** menjalankan
 `signup.py` di belakang layar, log ditayangkan langsung, dan hasil terbaca dari
-`accounts.json`. Hanya stdlib, tanpa install. Mode captcha/OTP manual belum
-didukung di WebUI — pakai provider otomatis + `EMAIL_SOURCE=emailnator`.
+`accounts.json`. Hanya stdlib, tanpa install. Captcha dan OTP manual juga bisa
+dijawab dari browser: gambarnya muncul di halaman, jawabannya diteruskan ke
+proses yang sedang menunggu.
+
+Tab **Hasil** bisa menyegarkan credit langsung: tombol putar per baris untuk
+satu akun, atau **Refresh credit terpilih** / **Refresh semua credit**. Hanya
+akun yang disegarkan yang ditimpa, jadi nilai akun lain tak hilang, dan waktu
+cek terakhir dicatat per akun.
 
 Argumen: `py webui.py 9000` (ganti port), `py webui.py --no-browser` (jangan
 buka tab otomatis). Port default bisa juga diset lewat env `WEBUI_PORT`.

@@ -238,7 +238,7 @@ def _reader(proc, run):
         run.cond.notify_all()   # bangunkan poller supaya tahu proses selesai
 
 
-def start(mode):
+def start(mode, args=()):
     with RUN.lock:
         if RUN.proc is not None and RUN.proc.poll() is None:
             return False, "masih berjalan — hentikan dulu"
@@ -247,6 +247,7 @@ def start(mode):
         cmd = [sys.executable, "-u", SIGNUP]
         if mode != "signup":
             cmd.append(mode)        # "credit" | "dump"
+        cmd += list(args)           # mis. daftar email untuk refresh sebagian
         env = os.environ.copy()
         # setting diatur lewat .env, bukan env var proses induk webui
         for k in CONFIG_KEYS:
@@ -321,6 +322,25 @@ def answer(value):
     except (BrokenPipeError, OSError, ValueError) as ex:
         return False, f"gagal kirim: {ex}"
     return True, None
+
+
+def refresh_credit(emails=()):
+    """Segarkan credit lewat `signup.py credit [email ...]`.
+
+    Email divalidasi terhadap accounts.json dulu: argumen ini masuk ke
+    command line, jadi jangan pernah meneruskan apa pun yang tak dikenal.
+    Daftar kosong -> segarkan semua akun.
+    """
+    acc = read_accounts()
+    if not acc:
+        return False, "accounts.json kosong"
+    if emails:
+        known = [e for e in emails if e in acc]
+        if not known:
+            return False, "akun tak ditemukan di accounts.json"
+    else:
+        known = []          # kosong = semua
+    return start("credit", known)
 
 
 def delete_account(email):
@@ -643,6 +663,15 @@ PAGE = r"""<!doctype html>
         <button class="sm danger" onclick="deleteSelected()" id="btn-del-sel"
                 disabled>Hapus terpilih</button>
       </div>
+      <div class="row" style="margin-bottom:4px">
+        <button class="sm" onclick="refreshCredit('sel')" id="btn-ref-sel"
+                disabled title="login lalu baca ulang credit dari Genspark">
+          Refresh credit terpilih</button>
+        <button class="sm" onclick="refreshCredit('all')" id="btn-ref-all"
+                title="login ke semua akun lalu baca ulang creditnya">
+          Refresh semua credit</button>
+        <span class="hint" id="ref-note"></span>
+      </div>
       <div class="flash" id="flash-hasil"></div>
       <div id="accounts" class="empty">memuat…</div>
     </section>
@@ -738,6 +767,9 @@ const ICON_COPY='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '+
 const ICON_EYE='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '+
   'stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7'+
   '-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const ICON_REF='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '+
+  'stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/>'+
+  '<path d="M21 3v6h-6"/></svg>';
 
 let ACC={};              // accounts terakhir dari server
 let RUNNING=false;
@@ -827,9 +859,15 @@ function renderRows(){
               '" title="copy API key">'+ICON_COPY+'</button>':'')+
       '</div></td>'+
       '<td>'+esc(v.payment_status||'')+'</td>'+
-      '<td>'+esc(v.created_at||'')+'</td>'+
-      '<td><button type="button" class="danger sm btn-del" data-email="'+esc(email)+
-      '"'+(RUNNING?' disabled':'')+'>Hapus</button></td></tr>';
+      '<td>'+esc(v.created_at||'')+
+        (v.checked_at?'<div class="hint">cek: '+esc(v.checked_at)+'</div>':'')+
+      '</td>'+
+      '<td class="row" style="gap:5px;flex-wrap:nowrap">'+
+        '<button type="button" class="iconbtn btn-ref" data-email="'+esc(email)+
+        '" title="refresh credit akun ini"'+(RUNNING?' disabled':'')+'>'+
+        ICON_REF+'</button>'+
+        '<button type="button" class="danger sm btn-del" data-email="'+esc(email)+
+        '"'+(RUNNING?' disabled':'')+'>Hapus</button></td></tr>';
   }
   el.innerHTML=html+'</tbody></table>';
   syncSelUI();
@@ -847,11 +885,16 @@ function syncSelUI(){
     const b=$(id); if(b) b.disabled=!n;});
   const bd=$('btn-del-sel');
   if(bd) bd.disabled=!n||RUNNING;
+  // refresh butuh proses bebas: tak bisa jalan kalau ada run lain
+  const rs=$('btn-ref-sel'), ra=$('btn-ref-all');
+  if(rs) rs.disabled=!n||RUNNING;
+  if(ra) ra.disabled=RUNNING||!Object.keys(ACC).length;
   ['btn-copy-sel','btn-csv-sel'].forEach(id=>{
     const b=$(id);
     if(b) b.textContent=(id==='btn-copy-sel'?'Copy terpilih':'CSV terpilih')+
       (n?' ('+n+')':'');});
   if(bd) bd.textContent='Hapus terpilih'+(n?' ('+n+')':'');
+  if(rs) rs.textContent='Refresh credit terpilih'+(n?' ('+n+')':'');
   const all=$('ck-all');
   if(all){
     all.checked = shown.length>0 && n===shown.length;
@@ -903,6 +946,25 @@ async function copyKeys(scope, fmt){
              (scope==='sel'?' — dari pilihan':'')
            : 'gagal copy — browser menolak akses clipboard',
         ok?'ok':'err');
+}
+
+async function refreshCredit(scope, one){
+  const data=new URLSearchParams();
+  let n=0;
+  if(one){ data.append('email', one); n=1; }
+  else if(scope==='sel'){
+    for(const e of SEL) data.append('email', e);
+    n=SEL.size;
+    if(!n){flash('belum ada baris dipilih','err'); return;}
+  }else{
+    n=Object.keys(ACC).length;      // tanpa email = semua
+  }
+  const j=await jpost('/api/refresh-credit', data);
+  if(!j.ok){flash(j.error||'gagal mulai refresh','err'); return;}
+  // refresh jalan sebagai proses `signup.py credit` -> lognya ke panel utama
+  logMode='credit'; lastSeq=0; $('log').innerHTML='';
+  $('ref-note').textContent='refresh '+n+' akun berjalan… lihat tab Buat akun untuk lognya';
+  flash('refresh credit '+n+' akun dimulai (login tiap akun, butuh beberapa detik)','ok');
 }
 
 async function deleteSelected(){
@@ -957,6 +1019,12 @@ document.addEventListener('click', async (ev)=>{
     const full=span.dataset.full;
     const open=span.classList.toggle('show');
     span.textContent=open?full:(full.slice(0,16)+'…');
+    return;
+  }
+  // refresh credit satu akun
+  const rf=ev.target.closest('.btn-ref');
+  if(rf){
+    refreshCredit(null, rf.dataset.email);
     return;
   }
   const btn=ev.target.closest('.btn-del');
@@ -1173,6 +1241,11 @@ class Handler(BaseHTTPRequestHandler):
             qs = self._post_form()
             email = qs.get("email", [""])[0]
             ok, err = delete_account(email)
+            self._json({"ok": ok, "error": err})
+        elif u.path == "/api/refresh-credit":
+            qs = self._post_form()
+            emails = [e for e in qs.get("email", []) if e]
+            ok, err = refresh_credit(emails)
             self._json({"ok": ok, "error": err})
         else:
             self.send_error(404)
