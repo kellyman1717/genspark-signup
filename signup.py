@@ -179,6 +179,14 @@ def get_emails():
     return emails
 
 
+class KeyDitolak(RuntimeError):
+    """API key ditolak Genspark (401/403) -- key mati, bukan gangguan jaringan.
+
+    Turunan RuntimeError supaya pemanggil lama yang menangkap RuntimeError
+    tetap bekerja seperti sebelumnya.
+    """
+
+
 def credit_by_key(api_key, proxy=None, timeout=None):
     """Sisa credit dari API key SAJA -- tanpa login, captcha, atau password.
 
@@ -191,29 +199,47 @@ def credit_by_key(api_key, proxy=None, timeout=None):
 
     Melempar RuntimeError dengan pesan yang bisa dibaca pengguna. API key
     TIDAK pernah masuk ke pesan error: pesan itu berakhir di log dan di UI.
+
+    Hanya 401/403 yang berarti key benar-benar ditolak; itu dilempar sebagai
+    KeyDitolak. Gangguan sesaat (timeout, 5xx, Cloudflare) dicoba ulang lalu
+    dilempar sebagai RuntimeError biasa, supaya pemanggil bisa membedakan
+    "key mati" dari "jaringan lagi rewel" -- keliru menyebut key mati berarti
+    memvonis akun yang sebetulnya sehat.
     """
     key = (api_key or "").strip()
     if not key:
         raise RuntimeError("API key kosong")
 
-    opener = proxies.build_opener(proxy)
     req = urllib.request.Request(
         f"{APP}/api/tool_cli/me",
         headers={"User-Agent": UA, "Accept": "application/json",
                  "X-Api-Key": key})
-    try:
-        raw = opener.open(req, timeout=timeout or TIMEOUT).read()
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            raise RuntimeError("API key ditolak (tidak valid atau dicabut)") from None
-        raise RuntimeError(f"HTTP {e.code} dari /api/tool_cli/me") from None
-    try:
-        j = json.loads(raw)
-    except ValueError:
-        raise RuntimeError("balasan bukan JSON (mungkin diblokir Cloudflare)") from None
-    if not isinstance(j, dict) or "credit_balance" not in j:
-        raise RuntimeError(f"balasan tak memuat credit_balance: {str(j)[:120]}")
-    return j
+    galat = None
+    for coba in range(3):
+        if coba:
+            time.sleep(0.6 * coba)          # jeda naik: 0.6s, 1.2s
+        try:
+            opener = proxies.build_opener(proxy)
+            raw = opener.open(req, timeout=timeout or TIMEOUT).read()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                # vonis permanen: tak ada gunanya diulang
+                raise KeyDitolak("API key ditolak (tidak valid atau dicabut)") from None
+            galat = f"HTTP {e.code} dari /api/tool_cli/me"
+            continue
+        except Exception as e:
+            galat = f"{type(e).__name__}: {str(e)[:60]}"
+            continue
+        try:
+            j = json.loads(raw)
+        except ValueError:
+            galat = "balasan bukan JSON (mungkin diblokir Cloudflare)"
+            continue
+        if not isinstance(j, dict) or "credit_balance" not in j:
+            galat = f"balasan tak memuat credit_balance: {str(j)[:100]}"
+            continue
+        return j
+    raise RuntimeError(f"{galat} (3x dicoba)")
 
 
 def key_cogen_id(api_key):
@@ -1224,8 +1250,9 @@ def check_keys(args):
         try:
             info = credit_by_key(k, proxy=PROXY_POOL.next())
         except Exception as ex:
-            return i, punya, None, f"{ex}"[:80]
-        return i, punya, info, None
+            # KeyDitolak = key mati; sisanya gangguan sesaat
+            return i, punya, None, f"{ex}"[:80], isinstance(ex, KeyDitolak)
+        return i, punya, info, None, False
 
     print(f"cek {len(keys)} key unik...")
     print()
@@ -1233,18 +1260,19 @@ def check_keys(args):
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futs = [pool.submit(one, i, k) for i, k in enumerate(keys)]
         for fut in as_completed(futs):
-            i, punya, info, err = fut.result()
-            rows[i] = (punya, info, err)
+            i, punya, info, err, tolak = fut.result()
+            rows[i] = (punya, info, err, tolak)
 
     total = 0.0
-    n = {"HIDUP": 0, "HABIS": 0, "INVALID": 0}
+    n = {"HIDUP": 0, "HABIS": 0, "INVALID": 0, "GAGAL": 0}
     hasil = []
     for i in range(len(keys)):
-        punya, info, err = rows[i]
+        punya, info, err, tolak = rows[i]
         if err:
-            # Key ditolak/dicabut: bedakan dari credit habis. Akun habis masih
-            # bisa diisi, key invalid sudah tak ada gunanya.
-            st, email, plan, credit = "INVALID", punya or "?", "?", ""
+            # Tiga sebab, tiga arti: HABIS masih bisa diisi, INVALID key-nya
+            # mati, GAGAL cuma jaringan rewel dan layak dicoba lagi.
+            st = "INVALID" if tolak else "GAGAL"
+            email, plan, credit = punya or "?", "?", ""
         else:
             credit = float(info.get("credit_balance") or 0)
             st = "HIDUP" if credit > 0 else "HABIS"
@@ -1259,8 +1287,12 @@ def check_keys(args):
         print(f"  {i + 1:3d} {st:7s} {email:40s} {ket}")
 
     print()
-    print(f"HIDUP {n['HIDUP']} | HABIS {n['HABIS']} | INVALID {n['INVALID']} "
-          f"| total credit {total:,.1f}")
+    print(f"HIDUP {n['HIDUP']} | HABIS {n['HABIS']} | INVALID {n['INVALID']}"
+          + (f" | GAGAL {n['GAGAL']}" if n["GAGAL"] else "")
+          + f" | total credit {total:,.1f}")
+    if n["GAGAL"]:
+        print(f"{n['GAGAL']} key tak terbaca karena gangguan jaringan (bukan "
+              "key mati); jalankan ulang untuk yang itu saja")
 
     if save:
         # newline="" wajib di Windows, kalau tidak tiap baris CSV dobel.

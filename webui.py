@@ -20,6 +20,7 @@ import sys
 import threading
 import urllib.parse
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import proxies  # dipakai agar hitungan proxy di UI sama dengan hitungan signup.py
@@ -397,39 +398,85 @@ def refresh_credit(emails=()):
     return start("credit", known)
 
 
-def check_key(api_key):
-    """Cek credit dari API key saja. Mengembalikan (data, error).
+# Batas key per permintaan. Tiap key = satu request ke Genspark, jadi tanpa
+# batas satu tempelan salah bisa jadi ribuan request sekaligus.
+MAX_KEYS = 200
+
+
+def split_keys(teks):
+    """Teks tempelan -> daftar key unik. Baris kosong dan '#' dilewati.
+
+    Pemisahnya baris, koma, spasi, dan titik-koma sekaligus: orang menempel
+    dari CSV, dari kolom spreadsheet, atau dari file .txt, dan ketiganya harus
+    sama-sama jalan tanpa perlu dirapikan dulu.
+    """
+    keys, seen = [], []
+    for baris in (teks or "").splitlines():
+        baris = baris.strip()
+        if not baris or baris.startswith("#"):
+            continue
+        for bagian in baris.replace(",", " ").replace(";", " ").split():
+            bagian = bagian.strip().strip('"').strip("'")
+            if bagian and not bagian.startswith("#") and bagian not in seen:
+                seen.append(bagian)
+                keys.append(bagian)
+    return keys
+
+
+def check_keys_bulk(teks):
+    """Cek credit banyak API key sekaligus. Mengembalikan (daftar, error).
 
     signup diimpor di sini, bukan di atas: impor itu membaca .env dan proxy.txt
     saat modul dimuat, dan WebUI harus tetap bisa dibuka walau .env belum ada.
 
-    Kuncinya TIDAK pernah masuk log, disk, atau argv -- karena itu fungsinya
+    Kunci TIDAK pernah masuk log, disk, atau argv -- karena itu fungsi ini
     memanggil signup langsung alih-alih `signup.py key <kunci>`.
     """
-    key = (api_key or "").strip()
-    if not key:
-        return None, "API key kosong"
+    keys = split_keys(teks)
+    if not keys:
+        return None, "Belum ada API key. Tempel key atau pilih file."
+    if len(keys) > MAX_KEYS:
+        return None, (f"{len(keys)} key sekaligus terlalu banyak; "
+                      f"batasnya {MAX_KEYS}. Pecah jadi beberapa bagian.")
     try:
         import signup
     except Exception as ex:
         return None, f"signup.py tak bisa dimuat: {ex}"
-    milik = None
-    cid = signup.key_cogen_id(key)
-    if cid:
-        milik = next((e for e, v in read_accounts().items()
-                      if v.get("cogen_id") == cid), None)
-    try:
-        info = signup.credit_by_key(key, proxy=signup.PROXY_POOL.next())
-    except Exception as ex:
-        # str(ex) dari credit_by_key sengaja tak memuat kunci
-        return None, str(ex)[:200]
-    return {
-        "email": milik or info.get("email"),
-        "tersimpan": bool(milik),
-        "plan": info.get("plan"),
-        # dibulatkan ke bawah, sama seperti check_credits: /me memberi float
-        "credit": int(info.get("credit_balance") or 0),
-    }, None
+
+    cid_ke_email = {v.get("cogen_id"): e for e, v in read_accounts().items()
+                    if v.get("cogen_id")}
+
+    def one(i, key):
+        # cogen_id dibaca lokal dari isi key: key yang sudah dicabut pun masih
+        # bisa ditelusuri milik siapa.
+        milik = cid_ke_email.get(signup.key_cogen_id(key))
+        try:
+            info = signup.credit_by_key(key, proxy=signup.PROXY_POOL.next())
+        except Exception as ex:
+            # INVALID hanya untuk key yang benar-benar ditolak Genspark.
+            # Gangguan jaringan -> GAGAL, supaya akun sehat tak divonis mati.
+            st = "INVALID" if isinstance(ex, signup.KeyDitolak) else "GAGAL"
+            # str(ex) dari credit_by_key sengaja tak memuat kunci
+            return i, {"status": st, "email": milik,
+                       "tersimpan": bool(milik), "plan": None, "credit": None,
+                       "error": str(ex)[:160]}
+        # float dari /me dipertahankan di sini; pembulatan ke bawah hanya
+        # dipakai saat menulis accounts.json.
+        credit = float(info.get("credit_balance") or 0)
+        return i, {"status": "HIDUP" if credit > 0 else "HABIS",
+                   "email": milik or info.get("email"),
+                   "tersimpan": bool(milik),
+                   "plan": info.get("plan"), "credit": credit, "error": None}
+
+    hasil = {}
+    workers = max(1, min(getattr(signup, "WORKERS", 6), len(keys)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(one, i, k) for i, k in enumerate(keys)]
+        for fut in as_completed(futs):
+            i, r = fut.result()
+            hasil[i] = r
+    # urutan tempelan dipertahankan supaya bisa dicocokkan dengan file sumber
+    return [dict(hasil[i], idx=i + 1) for i in range(len(keys))], None
 
 
 def delete_account(email):
@@ -781,6 +828,8 @@ PAGE = r"""<!doctype html>
   .keyout.err{background:var(--bad-soft);border-color:#F0C4C1;color:var(--bad)}
   .keyout b{font-family:var(--mono);font-variant-numeric:tabular-nums}
   .keyout .sub{display:block;margin-top:3px;font-size:12.5px;color:var(--ink-2)}
+  /* "tak dikenal" di tabel hasil key -- .idle hanya berlaku di panel log */
+  .nil{color:var(--ink-3);font-style:italic}
 
   .keycell{display:flex;align-items:center;gap:4px}
   .keytext{font-family:var(--mono);font-size:12px;max-width:210px;
@@ -923,18 +972,26 @@ PAGE = r"""<!doctype html>
   <div class="view" id="view-hasil">
     <section class="card">
       <h2>Cek credit dari API key</h2>
-      <p class="blurb">Tempel satu API key <code>gsk-</code> untuk melihat sisa
-        creditnya. Tak perlu password, tak perlu login, dan key-nya tidak
-        disimpan ke mana pun.</p>
-      <div class="bar" style="align-items:flex-start">
-        <input type="password" id="key-in" placeholder="gsk-..." autocomplete="off"
-               spellcheck="false" aria-label="API key"
-               style="flex:1;min-width:220px;font-family:var(--mono)"
-               onkeydown="if(event.key==='Enter')checkKey()">
+      <p class="blurb">Tempel API key <code>gsk-</code> &mdash; satu atau
+        banyak sekaligus, satu per baris &mdash; atau pilih file berisi daftar
+        key. Tak perlu password, tak perlu login, dan key-nya tidak disimpan ke
+        mana pun.</p>
+      <label class="lab" for="key-in">API key</label>
+      <textarea id="key-in" spellcheck="false" autocomplete="off"
+                placeholder="gsk-...&#10;gsk-...&#10;&#10;satu per baris; baris berawalan # dilewati"
+                oninput="countKeys()" style="min-height:96px"></textarea>
+      <div class="bar" style="margin-top:10px">
         <button class="btn tiny" id="btn-key" onclick="checkKey()">Cek credit</button>
+        <button class="btn tiny" onclick="pickKeyFile()">Pilih file...</button>
         <button class="btn tiny" onclick="clearKey()">Bersihkan</button>
+        <span class="tally" id="key-n"></span>
       </div>
+      <!-- file dibaca di browser lalu diisikan ke textarea, jadi server tak
+           perlu parser multipart sama sekali -->
+      <input type="file" id="key-file" accept=".txt,.csv,.log,text/*" hidden
+             onchange="readKeyFile(this)">
       <div id="key-out" class="keyout" hidden></div>
+      <div id="key-table"></div>
     </section>
 
     <section class="card">
@@ -1505,38 +1562,159 @@ async function copyKeys(scope, fmt){
          : 'Browser menolak akses clipboard, copy gagal.', ok?'ok':'err');
 }
 
-// Cek credit hanya dari API key. Key tak pernah ditaruh di URL, tak pernah
-// ditampilkan balik, dan input dikosongkan begitu hasilnya keluar.
+/* ---------------- cek credit dari API key (bulk) ---------------- */
+// Kunci tak pernah masuk URL, tak pernah ditampilkan balik, dan textarea
+// dikosongkan begitu hasilnya keluar. KEY_ROWS hanya memuat hasil, bukan kunci.
+let KEY_ROWS=[];
+
+// Pemisahnya harus sama dengan split_keys() di Python, kalau tidak angka di
+// penghitung berbeda dari jumlah yang benar-benar dicek.
+function splitKeys(teks){
+  const out=[], seen=new Set();
+  for(const baris of (teks||'').split(/\r?\n/)){
+    const b=baris.trim();
+    if(!b||b.startsWith('#')) continue;
+    for(let bag of b.replace(/[,;]/g,' ').split(/\s+/)){
+      bag=bag.replace(/^["']|["']$/g,'').trim();
+      if(bag&&!bag.startsWith('#')&&!seen.has(bag)){ seen.add(bag); out.push(bag); }
+    }
+  }
+  return out;
+}
+
+function countKeys(){
+  const n=splitKeys($('key-in').value).length;
+  $('key-n').innerHTML = n ? '<b>'+n+'<\/b> key unik siap dicek' : '';
+}
+
+function pickKeyFile(){ $('key-file').click(); }
+
+// Dibaca di browser: file tak pernah diunggah, jadi server tak perlu parser
+// multipart dan kunci tak melewati disk server.
+function readKeyFile(inp){
+  const f=inp.files&&inp.files[0];
+  if(!f) return;
+  const fr=new FileReader();
+  fr.onload=()=>{
+    const ta=$('key-in');
+    const lama=ta.value.trim();
+    ta.value=(lama?lama+'\n':'')+String(fr.result||'').trim();
+    inp.value='';                 // biar file yang sama bisa dipilih lagi
+    countKeys();
+    const n=splitKeys(ta.value).length;
+    say(f.name+' dimuat, '+n+' key unik siap dicek.','ok');
+  };
+  fr.onerror=()=>{ inp.value=''; say('Gagal membaca '+f.name+'.','err'); };
+  fr.readAsText(f);
+}
+
 async function checkKey(){
   const inp=$('key-in'), out=$('key-out'), btn=$('btn-key');
-  const key=inp.value.trim();
   const show=(cls,html)=>{ out.hidden=false; out.className='keyout '+cls;
                            out.innerHTML=html; };
-  if(!key){ show('err','Tempel API key dulu.'); inp.focus(); return; }
+  const keys=splitKeys(inp.value);
+  if(!keys.length){
+    show('err','Tempel API key dulu, atau pilih file berisi daftar key.');
+    inp.focus(); return;
+  }
   btn.disabled=true;
   const label=btn.textContent; btn.textContent='Mengecek...';
-  show('','Menghubungi Genspark...');
+  show('', 'Mengecek '+keys.length+' key di Genspark...');
+  $('key-table').innerHTML='';
   try{
-    const j=await jpost('/api/check-key', new URLSearchParams({key}));
-    if(!j.ok||!j.data){ show('err', esc(j.error||'Cek gagal.')); return; }
-    const d=j.data;
-    const milik = d.tersimpan
-      ? 'Cocok dengan akun tersimpan: <b>'+esc(d.email)+'<\/b>'
-      : (d.email ? 'Akun: <b>'+esc(d.email)+'<\/b> (tak ada di accounts.json)'
-                 : 'Key ini tak cocok dengan akun mana pun di accounts.json.');
-    show('ok','Sisa credit <b>'+numId(d.credit)+'<\/b>'+
-              (d.plan?' &middot; plan <b>'+esc(d.plan)+'<\/b>':'')+
-              '<span class="sub">'+milik+'<\/span>');
-    inp.value='';                 // jangan tinggalkan key di DOM
+    const j=await jpost('/api/check-key',
+                        new URLSearchParams({key:inp.value}));
+    if(!j.ok||!j.rows){ show('err', esc(j.error||'Cek gagal.')); return; }
+    KEY_ROWS=j.rows;
+    inp.value='';                 // jangan tinggalkan kunci di DOM
+    countKeys();
+    renderKeyRows();
   }finally{
     btn.disabled=false; btn.textContent=label;
   }
+}
+
+function renderKeyRows(){
+  const out=$('key-out');
+  const n={HIDUP:0,HABIS:0,INVALID:0,GAGAL:0};
+  let total=0;
+  for(const r of KEY_ROWS){
+    n[r.status]=(n[r.status]||0)+1;
+    if(r.status==='HIDUP') total+=Number(r.credit)||0;
+  }
+  const satu=KEY_ROWS.length===1;
+  out.hidden=false;
+  out.className='keyout '+(n.HIDUP+n.HABIS?'ok':'err');
+  out.innerHTML='Total credit <b>'+numId(Math.round(total))+'<\/b>'+
+    '<span class="sub">'+
+      'HIDUP <b>'+n.HIDUP+'<\/b> &middot; HABIS <b>'+n.HABIS+
+      '<\/b> &middot; INVALID <b>'+n.INVALID+'<\/b>'+
+      (n.GAGAL?' &middot; GAGAL <b>'+n.GAGAL+'<\/b>':'')+
+      ' dari '+KEY_ROWS.length+
+      ' key'+(satu?'':' &mdash; urutannya sama dengan yang Anda tempel')+
+    '<\/span>'+
+    (n.GAGAL?'<span class="sub">'+n.GAGAL+' key tak terbaca karena gangguan '+
+      'jaringan, bukan key mati &mdash; coba lagi untuk yang itu.<\/span>':'');
+
+  // Satu key: cukup ringkasan di atas, tabel satu baris cuma bikin ramai.
+  if(satu){
+    const r=KEY_ROWS[0];
+    $('key-table').innerHTML='';
+    out.innerHTML += '<span class="sub">'+
+      (r.error ? esc(r.error)
+               : (r.plan?'plan <b>'+esc(r.plan)+'<\/b> &middot; ':'')+
+                 (r.email ? (r.tersimpan?'akun tersimpan <b>':'akun <b>')+
+                            esc(r.email)+'<\/b>'+
+                            (r.tersimpan?'':' (tak ada di accounts.json)')
+                          : 'tak cocok dengan akun mana pun di accounts.json'))+
+      '<\/span>';
+    return;
+  }
+
+  let h='<div class="bar" style="margin:12px 0 8px">'+
+    '<button class="btn tiny" onclick="copyKeyRows()">Copy hasil CSV<\/button>'+
+    '<\/div><div class="tbl-wrap"><table><thead><tr>'+
+    '<th>#<\/th><th>Status<\/th><th>Akun<\/th><th>Plan<\/th>'+
+    '<th class="c-num">Credit<\/th><\/tr><\/thead><tbody>';
+  for(const r of KEY_ROWS){
+    // GAGAL netral, bukan merah: key-nya belum tentu bermasalah
+    const kelas = r.status==='HIDUP'?'good'
+                : (r.status==='HABIS'||r.status==='INVALID')?'bad':'';
+    h+='<tr>'+
+      '<td data-h="#" class="c-num">'+r.idx+'<\/td>'+
+      '<td data-h="Status"><span class="tag '+kelas+'">'+r.status+'<\/span><\/td>'+
+      '<td data-h="Akun" class="c-mail">'+
+        (r.email?esc(r.email):'<span class="nil">tak dikenal<\/span>')+
+        (r.email&&!r.tersimpan
+          ?'<div class="sub">tak ada di accounts.json<\/div>':'')+
+        (r.error?'<div class="sub">'+esc(r.error)+'<\/div>':'')+
+      '<\/td>'+
+      '<td data-h="Plan">'+(r.plan?esc(r.plan):'&mdash;')+'<\/td>'+
+      '<td data-h="Credit" class="c-num">'+
+        (r.credit==null?'&mdash;':numId(Math.round(r.credit)))+'<\/td>'+
+    '<\/tr>';
+  }
+  $('key-table').innerHTML=h+'<\/tbody><\/table><\/div>';
+}
+
+async function copyKeyRows(){
+  if(!KEY_ROWS.length){ say('Belum ada hasil untuk dicopy.','err'); return; }
+  // kunci sengaja TIDAK ikut: CSV ini sering ditempel ke tempat lain
+  const csv='idx,status,email,plan,credit,error\n'+KEY_ROWS.map(r=>
+    [r.idx, r.status, r.email||'', r.plan||'', r.credit??'',
+     (r.error||'').replace(/[",\n]/g,' ')].join(',')).join('\n');
+  const ok=await copyText(csv);
+  say(ok?KEY_ROWS.length+' baris CSV dicopy.'
+        :'Browser menolak akses clipboard, copy gagal.', ok?'ok':'err');
 }
 
 function clearKey(){
   $('key-in').value='';
   $('key-out').hidden=true;
   $('key-out').innerHTML='';
+  $('key-table').innerHTML='';
+  KEY_ROWS=[];
+  countKeys();
   $('key-in').focus();
 }
 
@@ -1748,8 +1926,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "error": err})
         elif u.path == "/api/check-key":
             qs = self._post_form()
-            data, err = check_key(qs.get("key", [""])[0])
-            self._json({"ok": data is not None, "error": err, "data": data})
+            rows, err = check_keys_bulk(qs.get("key", [""])[0])
+            self._json({"ok": rows is not None, "error": err, "rows": rows})
         elif u.path == "/api/refresh-credit":
             qs = self._post_form()
             emails = [e for e in qs.get("email", []) if e]
