@@ -792,6 +792,14 @@ PAGE = r"""<!doctype html>
                  margin-right:2px}
   .picked-bar[hidden]{display:none}
 
+  .pager{display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+         margin:10px 0}
+  .pager .pinfo{font-size:12.5px;color:var(--ink-2);margin:0 4px}
+  .pager .pinfo b{font-family:var(--mono);font-variant-numeric:tabular-nums;
+                  color:var(--ink);font-weight:600}
+  .pager .pinfo .sub{display:inline;font-size:12.5px;color:var(--ink-3)}
+  .pager .btn[disabled]{opacity:.4;cursor:default}
+
   .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
   table{width:100%;border-collapse:collapse;font-size:13px}
   thead th{text-align:left;padding:10px 12px;font-size:11.5px;font-weight:650;
@@ -1028,6 +1036,16 @@ PAGE = r"""<!doctype html>
             <input type="date" id="f-to" aria-label="Tanggal akhir"
                    onchange="applyFilter()">
           </div>
+        </div>
+        <div class="f">
+          <span class="lab">Per halaman</span>
+          <select id="f-per" onchange="setPer(this.value)"
+                  aria-label="Jumlah akun per halaman">
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="0">Semua</option>
+          </select>
         </div>
         <div class="f">
           <span class="lab">&nbsp;</span>
@@ -1393,6 +1411,7 @@ function filtered(){
 
 function applyFilter(){
   $('f-range').hidden = $('f-time').value!=='custom';
+  PAGE=1;                    // filter baru: mulai dari halaman pertama
   renderRows();
 }
 
@@ -1400,6 +1419,52 @@ function resetFilter(){
   ['f-cmin','f-cmax','f-from','f-to'].forEach(k=>$(k).value='');
   $('f-time').value='';
   applyFilter();
+}
+
+/* ---------------- pagination tabel Hasil ---------------- */
+// PER=0 berarti tampilkan semua. PAGE dijaga tetap valid oleh halaman() supaya
+// polling 2.5s atau penghapusan akun tak pernah meninggalkan halaman kosong.
+let PAGE=1, PER=25;
+
+function totalHal(n){ return PER?Math.max(1, Math.ceil(n/PER)):1; }
+
+function halaman(rows){
+  if(!PER) { PAGE=1; return rows; }
+  const th=totalHal(rows.length);
+  if(PAGE>th) PAGE=th;
+  if(PAGE<1) PAGE=1;
+  const mulai=(PAGE-1)*PER;
+  return rows.slice(mulai, mulai+PER);
+}
+
+function gotoHal(n){
+  const th=totalHal(filtered().length);
+  PAGE=Math.min(Math.max(1, n), th);
+  renderRows();
+}
+
+function setPer(v){
+  PER=Number(v)||0;
+  PAGE=1;
+  renderRows();
+}
+
+function pagerHTML(n){
+  if(!PER || n<=PER) return '';
+  const th=totalHal(n);
+  const dari=(PAGE-1)*PER+1, sampai=Math.min(PAGE*PER, n);
+  return '<div class="pager">'+
+    '<button class="btn tiny" onclick="gotoHal(1)"'+
+      (PAGE<=1?' disabled':'')+' aria-label="Halaman pertama">&laquo;</button>'+
+    '<button class="btn tiny" onclick="gotoHal('+(PAGE-1)+')"'+
+      (PAGE<=1?' disabled':'')+' aria-label="Halaman sebelumnya">&lsaquo;</button>'+
+    '<span class="pinfo">'+dari+'&ndash;'+sampai+' dari <b>'+n+'</b>'+
+      '<span class="sub"> &middot; hal '+PAGE+'/'+th+'</span></span>'+
+    '<button class="btn tiny" onclick="gotoHal('+(PAGE+1)+')"'+
+      (PAGE>=th?' disabled':'')+' aria-label="Halaman berikutnya">&rsaquo;</button>'+
+    '<button class="btn tiny" onclick="gotoHal('+th+')"'+
+      (PAGE>=th?' disabled':'')+' aria-label="Halaman terakhir">&raquo;</button>'+
+    '</div>';
 }
 
 function toggleAllKeys(){
@@ -1450,14 +1515,16 @@ function renderRows(){
     syncSelUI(); return;
   }
 
-  let h='<div class="tbl-wrap"><table><thead><tr>'+
+  const hal=halaman(rows);
+  let h=pagerHTML(rows.length)+
+    '<div class="tbl-wrap"><table><thead><tr>'+
     '<th style="width:34px"><input type="checkbox" id="ck-all" '+
-      'aria-label="Pilih semua yang tampil"></th>'+
+      'aria-label="Pilih semua di halaman ini"></th>'+
     '<th>Email</th><th>Plan</th><th class="c-num">Credit</th>'+
     '<th>API key</th><th>Bayar</th><th>Dibuat</th>'+
     '<th class="c-act">Aksi</th></tr></thead><tbody>';
 
-  for(const [email,v] of rows){
+  for(const [email,v] of hal){
     const full=v.api_key||'';
     const shown=showKeys?full:(full?full.slice(0,16)+'…':'');
     const on=SEL.has(email);
@@ -1495,14 +1562,20 @@ function renderRows(){
           (RUNNING?' disabled':'')+'>'+ICON_DEL+'</button>'+
       '</td></tr>';
   }
-  el.innerHTML=h+'</tbody></table></div>';
+  el.innerHTML=h+'</tbody></table></div>'+pagerHTML(rows.length);
   syncSelUI();
 }
 
 function syncSelUI(){
-  const shown=filtered().map(([e])=>e);
-  // buang pilihan yang tak lagi tampil karena filter berubah
-  for(const e of [...SEL]) if(!shown.includes(e)) SEL.delete(e);
+  // Pilihan bertahan lintas halaman (bisa mengumpulkan dari beberapa halaman),
+  // tapi yang tersaring habis oleh filter dibuang -- kalau tidak, tombol hapus
+  // bisa mengenai akun yang tak terlihat sama sekali.
+  const lolos=filtered().map(([e])=>e);
+  for(const e of [...SEL]) if(!lolos.includes(e)) SEL.delete(e);
+  // ck-all hanya mewakili halaman yang tampil: satu klik tak boleh diam-diam
+  // memilih ratusan akun di halaman lain.
+  const shown=[...document.querySelectorAll('.ck-row')].map(c=>c.dataset.email);
+  const nHal=shown.filter(e=>SEL.has(e)).length;
   const n=SEL.size;
   $('picked-bar').hidden=!n;
   $('picked-n').textContent=n+' akun dipilih';
@@ -1512,8 +1585,8 @@ function syncSelUI(){
   if(ra) ra.disabled=RUNNING||!Object.keys(ACC).length;
   const all=$('ck-all');
   if(all){
-    all.checked = shown.length>0 && n===shown.length;
-    all.indeterminate = n>0 && n<shown.length;
+    all.checked = shown.length>0 && nHal===shown.length;
+    all.indeterminate = nHal>0 && nHal<shown.length;
   }
 }
 
@@ -1565,7 +1638,13 @@ async function copyKeys(scope, fmt){
 /* ---------------- cek credit dari API key (bulk) ---------------- */
 // Kunci tak pernah masuk URL, tak pernah ditampilkan balik, dan textarea
 // dikosongkan begitu hasilnya keluar. KEY_ROWS hanya memuat hasil, bukan kunci.
-let KEY_ROWS=[];
+//
+// KEY_SRC memegang kunci yang tadi ditempel, dipetakan dari idx, supaya tombol
+// "Copy key HIDUP" bisa mengembalikannya. Ini variabel JS, bukan DOM: kunci
+// tetap tak pernah dirender, tak masuk balasan server, tak masuk CSV, dan
+// hilang begitu clearKey() atau halaman ditutup. Server pun tak perlu tahu --
+// kuncinya memang berasal dari pemakai di halaman ini sendiri.
+let KEY_ROWS=[], KEY_SRC={}, KEY_SEL=new Set();
 
 // Pemisahnya harus sama dengan split_keys() di Python, kalau tidak angka di
 // penghitung berbeda dari jumlah yang benar-benar dicek.
@@ -1626,6 +1705,9 @@ async function checkKey(){
                         new URLSearchParams({key:inp.value}));
     if(!j.ok||!j.rows){ show('err', esc(j.error||'Cek gagal.')); return; }
     KEY_ROWS=j.rows;
+    // idx dari server = urutan tempelan (1-basis), jadi keys[idx-1] pasti pas
+    KEY_SRC={}; keys.forEach((k,i)=>{ KEY_SRC[i+1]=k; });
+    KEY_SEL=new Set();
     inp.value='';                 // jangan tinggalkan kunci di DOM
     countKeys();
     renderKeyRows();
@@ -1671,16 +1753,31 @@ function renderKeyRows(){
     return;
   }
 
+  const nMati=KEY_ROWS.filter(r=>r.status==='HABIS'||r.status==='INVALID')
+                      .length;
   let h='<div class="bar" style="margin:12px 0 8px">'+
+    '<button class="btn tiny" onclick="copyKeyHidup()">Copy key HIDUP'+
+      (n.HIDUP?' ('+n.HIDUP+')':'')+'<\/button>'+
     '<button class="btn tiny" onclick="copyKeyRows()">Copy hasil CSV<\/button>'+
+    (nMati?'<button class="btn tiny" onclick="pilihKeyMati()">Pilih semua '+
+      'HABIS &amp; INVALID ('+nMati+')<\/button>':'')+
+    '<span class="tally" id="key-sel"><\/span>'+
     '<\/div><div class="tbl-wrap"><table><thead><tr>'+
+    '<th style="width:34px"><input type="checkbox" id="ck-key-all" '+
+      'onchange="toggleKeyAll(this.checked)" '+
+      'aria-label="Pilih semua baris hasil"><\/th>'+
     '<th>#<\/th><th>Status<\/th><th>Akun<\/th><th>Plan<\/th>'+
     '<th class="c-num">Credit<\/th><\/tr><\/thead><tbody>';
   for(const r of KEY_ROWS){
     // GAGAL netral, bukan merah: key-nya belum tentu bermasalah
     const kelas = r.status==='HIDUP'?'good'
                 : (r.status==='HABIS'||r.status==='INVALID')?'bad':'';
-    h+='<tr>'+
+    const on=KEY_SEL.has(r.idx);
+    h+='<tr'+(on?' class="picked"':'')+'>'+
+      '<td data-h="Pilih"><input type="checkbox" class="ck-key" '+
+        'data-idx="'+r.idx+'"'+(on?' checked':'')+
+        ' onchange="toggleKeyRow('+r.idx+',this.checked)" '+
+        'aria-label="Pilih baris '+r.idx+'"><\/td>'+
       '<td data-h="#" class="c-num">'+r.idx+'<\/td>'+
       '<td data-h="Status"><span class="tag '+kelas+'">'+r.status+'<\/span><\/td>'+
       '<td data-h="Akun" class="c-mail">'+
@@ -1694,7 +1791,86 @@ function renderKeyRows(){
         (r.credit==null?'&mdash;':numId(Math.round(r.credit)))+'<\/td>'+
     '<\/tr>';
   }
-  $('key-table').innerHTML=h+'<\/tbody><\/table><\/div>';
+  $('key-table').innerHTML=h+'<\/tbody><\/table><\/div>'+
+    '<div class="bar" style="margin:10px 0 0">'+
+    '<button class="btn tiny stop" id="btn-key-del" onclick="hapusKeyRows()" '+
+      'disabled>Hapus baris terpilih<\/button>'+
+    '<\/div>';
+  syncKeySel();
+}
+
+/* Pilih & hapus baris hasil. Yang dibuang hanya baris di daftar ini beserta
+   kuncinya di KEY_SRC -- accounts.json tak disentuh sama sekali, jadi tak ada
+   risiko menghanguskan akun berbayar. */
+function toggleKeyRow(idx, on){
+  if(on) KEY_SEL.add(idx); else KEY_SEL.delete(idx);
+  const ck=document.querySelector('.ck-key[data-idx="'+idx+'"]');
+  if(ck) ck.closest('tr').classList.toggle('picked', on);
+  syncKeySel();
+}
+
+function toggleKeyAll(on){
+  KEY_SEL=on?new Set(KEY_ROWS.map(r=>r.idx)):new Set();
+  document.querySelectorAll('.ck-key').forEach(c=>{
+    c.checked=on;
+    c.closest('tr').classList.toggle('picked', on);
+  });
+  syncKeySel();
+}
+
+function pilihKeyMati(){
+  for(const r of KEY_ROWS){
+    if(r.status==='HABIS'||r.status==='INVALID') KEY_SEL.add(r.idx);
+  }
+  document.querySelectorAll('.ck-key').forEach(c=>{
+    const on=KEY_SEL.has(Number(c.dataset.idx));
+    c.checked=on;
+    c.closest('tr').classList.toggle('picked', on);
+  });
+  syncKeySel();
+}
+
+function syncKeySel(){
+  const n=KEY_SEL.size;
+  const lab=$('key-sel');
+  if(lab) lab.innerHTML = n?'<b>'+n+'<\/b> baris dipilih':'';
+  const btn=$('btn-key-del');
+  if(btn){
+    btn.disabled=!n;
+    btn.textContent = n?'Hapus '+n+' baris terpilih':'Hapus baris terpilih';
+  }
+  const all=$('ck-key-all');
+  if(all){
+    all.checked = KEY_ROWS.length>0 && n===KEY_ROWS.length;
+    all.indeterminate = n>0 && n<KEY_ROWS.length;
+  }
+}
+
+function hapusKeyRows(){
+  if(!KEY_SEL.size){ say('Belum ada baris yang dipilih.','err'); return; }
+  const n=KEY_SEL.size;
+  for(const idx of KEY_SEL) delete KEY_SRC[idx];   // jangan tinggalkan kunci
+  KEY_ROWS=KEY_ROWS.filter(r=>!KEY_SEL.has(r.idx));
+  KEY_SEL=new Set();
+  if(!KEY_ROWS.length){
+    // habis semua: kembalikan ke keadaan bersih, bukan tabel kosong
+    $('key-out').hidden=true; $('key-out').innerHTML='';
+    $('key-table').innerHTML='';
+    KEY_SRC={};
+  }else{
+    renderKeyRows();
+  }
+  say(n+' baris dibuang dari hasil. accounts.json tidak diubah.','ok');
+}
+
+async function copyKeyHidup(){
+  // idx dipakai sebagai jembatan ke kunci asli yang masih dipegang browser
+  const keys=KEY_ROWS.filter(r=>r.status==='HIDUP')
+                     .map(r=>KEY_SRC[r.idx]).filter(Boolean);
+  if(!keys.length){ say('Tidak ada key HIDUP untuk dicopy.','err'); return; }
+  const ok=await copyText(keys.join('\n'));
+  say(ok?keys.length+' API key HIDUP dicopy.'
+        :'Browser menolak akses clipboard, copy gagal.', ok?'ok':'err');
 }
 
 async function copyKeyRows(){
@@ -1713,7 +1889,7 @@ function clearKey(){
   $('key-out').hidden=true;
   $('key-out').innerHTML='';
   $('key-table').innerHTML='';
-  KEY_ROWS=[];
+  KEY_ROWS=[]; KEY_SRC={}; KEY_SEL=new Set();
   countKeys();
   $('key-in').focus();
 }
@@ -1761,10 +1937,10 @@ document.addEventListener('change', (ev)=>{
     return;
   }
   if(ev.target.id==='ck-all'){
+    // hanya halaman yang tampil; pilihan di halaman lain dibiarkan utuh
     const on=ev.target.checked;
-    SEL.clear();
-    if(on) filtered().forEach(([e])=>SEL.add(e));
     document.querySelectorAll('.ck-row').forEach(c=>{
+      if(on) SEL.add(c.dataset.email); else SEL.delete(c.dataset.email);
       c.checked=on;
       c.closest('tr').classList.toggle('picked', on);
     });
