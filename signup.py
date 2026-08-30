@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Genspark.ai auto-signup per email from akun.txt (Azure AD B2C flow)."""
 import json, re, sys, time, urllib.parse, urllib.request, urllib.error, base64, os, webbrowser
+import csv
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1163,28 +1164,121 @@ def check_credits(only=None):
               "<- angka inilah yang tampil di WebUI")
 
 
-def check_keys(keys):
-    """py signup.py key <gsk-...> [gsk-...] -> cek credit hanya dari API key."""
+def load_keys(path):
+    """Baca API key dari file, satu per baris. Kosong dan '#' dilewati.
+
+    Duplikat dibuang: satu key dua kali berarti satu akun dihitung dua kali di
+    total, dan itu kesalahan yang sulit terlihat pada daftar panjang.
+    """
+    keys, seen = [], set()
+    with open(path, encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or ln in seen:
+                continue
+            seen.add(ln)
+            keys.append(ln)
+    return keys
+
+
+def check_keys(args):
+    """py signup.py key <gsk-...|file> [...] [--save hasil.csv]
+
+    Cek credit hanya dari API key -- tanpa login, password, atau captcha.
+    Argumen boleh key langsung atau nama file berisi key.
+    """
+    save = None
+    if "--save" in args:
+        i = args.index("--save")
+        if i + 1 >= len(args):
+            print("--save butuh nama file CSV")
+            return
+        save = args[i + 1]
+        args = args[:i] + args[i + 2:]
+
+    # Argumen yang bukan key dianggap nama file. Key selalu diawali "gsk-",
+    # jadi keduanya bisa dibedakan tanpa menyentuh disk untuk tiap argumen.
+    keys, seen = [], set()
+    for a in args:
+        masuk = [a] if a.startswith("gsk-") else None
+        if masuk is None:
+            try:
+                masuk = load_keys(a)
+            except OSError as ex:
+                print(f"tak bisa baca {a}: {ex}")
+                return
+        for k in masuk:
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    if not keys:
+        print("tak ada API key untuk dicek")
+        return
+
     accounts = load_accounts()
     # cogen_id -> email, untuk mengenali key lepas tanpa memanggil Genspark
     milik = {v.get("cogen_id"): e for e, v in accounts.items() if v.get("cogen_id")}
-    for k in keys:
+
+    def one(i, k):
         punya = milik.get(key_cogen_id(k))
         try:
             info = credit_by_key(k, proxy=PROXY_POOL.next())
-        except RuntimeError as ex:
-            print(f"  GAGAL {(punya or 'key ' + k[:12] + '...')}: {ex}")
-            continue
-        print(f"  {info.get('email') or punya or '(email tak diketahui)'}")
-        print(f"        plan={info.get('plan')} credit={info.get('credit_balance')}"
-              + (f" tersimpan sebagai {punya}" if punya else " (tidak ada di accounts.json)"))
+        except Exception as ex:
+            return i, punya, None, f"{ex}"[:80]
+        return i, punya, info, None
+
+    print(f"cek {len(keys)} key unik...")
+    print()
+    rows = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futs = [pool.submit(one, i, k) for i, k in enumerate(keys)]
+        for fut in as_completed(futs):
+            i, punya, info, err = fut.result()
+            rows[i] = (punya, info, err)
+
+    total = 0.0
+    n = {"HIDUP": 0, "HABIS": 0, "INVALID": 0}
+    hasil = []
+    for i in range(len(keys)):
+        punya, info, err = rows[i]
+        if err:
+            # Key ditolak/dicabut: bedakan dari credit habis. Akun habis masih
+            # bisa diisi, key invalid sudah tak ada gunanya.
+            st, email, plan, credit = "INVALID", punya or "?", "?", ""
+        else:
+            credit = float(info.get("credit_balance") or 0)
+            st = "HIDUP" if credit > 0 else "HABIS"
+            total += credit if credit > 0 else 0
+            email = punya or info.get("email") or "?"
+            plan = info.get("plan") or "?"
+        n[st] += 1
+        hasil.append({"idx": i + 1, "status": st, "email": email, "plan": plan,
+                      "credit": credit, "error": err or ""})
+        ket = err or f"plan={plan} credit={credit}"
+        # kuncinya sendiri tak pernah dicetak
+        print(f"  {i + 1:3d} {st:7s} {email:40s} {ket}")
+
+    print()
+    print(f"HIDUP {n['HIDUP']} | HABIS {n['HABIS']} | INVALID {n['INVALID']} "
+          f"| total credit {total:,.1f}")
+
+    if save:
+        # newline="" wajib di Windows, kalau tidak tiap baris CSV dobel.
+        # csv.writer mengutip sendiri, jadi koma di pesan error aman.
+        with open(save, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["idx", "status", "email", "plan",
+                                              "credit", "error"])
+            w.writeheader()
+            w.writerows(hasil)
+        print(f"hasil tersimpan: {save}")
 
 
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg in ("key", "keys", "apikey"):
         if len(sys.argv) < 3:
-            print("pakai: py signup.py key <gsk-...> [gsk-...]")
+            print("pakai: py signup.py key <gsk-...|file> [...] [--save hasil.csv]")
+            print("       file = daftar key, satu per baris ('#' = komentar)")
         else:
             check_keys(sys.argv[2:])
     elif arg in ("credit", "credits", "saldo"):
