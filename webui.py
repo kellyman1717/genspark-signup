@@ -397,6 +397,41 @@ def refresh_credit(emails=()):
     return start("credit", known)
 
 
+def check_key(api_key):
+    """Cek credit dari API key saja. Mengembalikan (data, error).
+
+    signup diimpor di sini, bukan di atas: impor itu membaca .env dan proxy.txt
+    saat modul dimuat, dan WebUI harus tetap bisa dibuka walau .env belum ada.
+
+    Kuncinya TIDAK pernah masuk log, disk, atau argv -- karena itu fungsinya
+    memanggil signup langsung alih-alih `signup.py key <kunci>`.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        return None, "API key kosong"
+    try:
+        import signup
+    except Exception as ex:
+        return None, f"signup.py tak bisa dimuat: {ex}"
+    milik = None
+    cid = signup.key_cogen_id(key)
+    if cid:
+        milik = next((e for e, v in read_accounts().items()
+                      if v.get("cogen_id") == cid), None)
+    try:
+        info = signup.credit_by_key(key, proxy=signup.PROXY_POOL.next())
+    except Exception as ex:
+        # str(ex) dari credit_by_key sengaja tak memuat kunci
+        return None, str(ex)[:200]
+    return {
+        "email": milik or info.get("email"),
+        "tersimpan": bool(milik),
+        "plan": info.get("plan"),
+        # dibulatkan ke bawah, sama seperti check_credits: /me memberi float
+        "credit": int(info.get("credit_balance") or 0),
+    }, None
+
+
 def delete_account(email):
     """Hapus satu akun dari accounts.json. Ditolak kalau proses berjalan --
     signup.py menulis balik file itu dari salinan di memorinya, jadi hapus
@@ -738,6 +773,15 @@ PAGE = r"""<!doctype html>
      Ini butuh perhatian, tapi bukan tombol berbahaya. */
   .tag.bad{background:#FDF3E0;color:var(--warn);border-color:#E8CFA0}
 
+  /* Hasil cek API key. Dipisah dari .say supaya bisa memuat beberapa baris
+     data tanpa terlihat seperti notifikasi sesaat. */
+  .keyout{margin-top:12px;padding:11px 13px;border-radius:var(--r);
+          border:1px solid var(--line);background:var(--sunken);font-size:14px}
+  .keyout.ok{background:var(--act-soft);border-color:#A9D6CC}
+  .keyout.err{background:var(--bad-soft);border-color:#F0C4C1;color:var(--bad)}
+  .keyout b{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .keyout .sub{display:block;margin-top:3px;font-size:12.5px;color:var(--ink-2)}
+
   .keycell{display:flex;align-items:center;gap:4px}
   .keytext{font-family:var(--mono);font-size:12px;max-width:210px;
        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -877,6 +921,22 @@ PAGE = r"""<!doctype html>
 
   <!-- ================= Hasil ================= -->
   <div class="view" id="view-hasil">
+    <section class="card">
+      <h2>Cek credit dari API key</h2>
+      <p class="blurb">Tempel satu API key <code>gsk-</code> untuk melihat sisa
+        creditnya. Tak perlu password, tak perlu login, dan key-nya tidak
+        disimpan ke mana pun.</p>
+      <div class="bar" style="align-items:flex-start">
+        <input type="password" id="key-in" placeholder="gsk-..." autocomplete="off"
+               spellcheck="false" aria-label="API key"
+               style="flex:1;min-width:220px;font-family:var(--mono)"
+               onkeydown="if(event.key==='Enter')checkKey()">
+        <button class="btn tiny" id="btn-key" onclick="checkKey()">Cek credit</button>
+        <button class="btn tiny" onclick="clearKey()">Bersihkan</button>
+      </div>
+      <div id="key-out" class="keyout" hidden></div>
+    </section>
+
     <section class="card">
       <h2>Akun tersimpan</h2>
       <p class="blurb">Dibaca dari <code>accounts.json</code> dan diperbarui
@@ -1293,15 +1353,18 @@ function toggleAllKeys(){
 
 function clearSel(){ SEL.clear(); renderRows(); }
 
-// Tiga keadaan, bukan dua: true = sudah dimatikan, false = dicoba tapi gagal
+// Tiga keadaan, bukan dua: true = sudah dinyalakan, false = dicoba tapi gagal
 // (perlu perhatian), undefined = akun dibuat sebelum fitur ini ada, jadi
 // statusnya memang belum diketahui -- jangan ditampilkan seolah bermasalah.
+// data_retention_disabled adalah nama lama dengan arti TERBALIK; akun lama
+// tak dibaca lagi supaya tak pernah dilaporkan keliru, dan akan terisi
+// sendiri saat cek credit berikutnya.
 function retTag(v){
-  const r=v.data_retention_disabled;
+  const r=v.data_retention_on;
   if(r===true)  return ' <span class="tag good" title="AI data retention '+
-    'sudah dimatikan">retention off</span>';
-  if(r===false) return ' <span class="tag bad" title="Gagal mematikan AI data '+
-    'retention. Tekan Cek ulang credit untuk mencoba lagi.">retention aktif</span>';
+    'sudah dinyalakan">retention on</span>';
+  if(r===false) return ' <span class="tag bad" title="Gagal menyalakan AI data '+
+    'retention. Tekan Cek ulang credit untuk mencoba lagi.">retention mati</span>';
   return '';
 }
 
@@ -1440,6 +1503,41 @@ async function copyKeys(scope, fmt){
   const ok=await copyText(text);
   say(ok ? rows.length+(fmt==='csv'?' baris CSV dicopy.':' API key dicopy.')
          : 'Browser menolak akses clipboard, copy gagal.', ok?'ok':'err');
+}
+
+// Cek credit hanya dari API key. Key tak pernah ditaruh di URL, tak pernah
+// ditampilkan balik, dan input dikosongkan begitu hasilnya keluar.
+async function checkKey(){
+  const inp=$('key-in'), out=$('key-out'), btn=$('btn-key');
+  const key=inp.value.trim();
+  const show=(cls,html)=>{ out.hidden=false; out.className='keyout '+cls;
+                           out.innerHTML=html; };
+  if(!key){ show('err','Tempel API key dulu.'); inp.focus(); return; }
+  btn.disabled=true;
+  const label=btn.textContent; btn.textContent='Mengecek...';
+  show('','Menghubungi Genspark...');
+  try{
+    const j=await jpost('/api/check-key', new URLSearchParams({key}));
+    if(!j.ok||!j.data){ show('err', esc(j.error||'Cek gagal.')); return; }
+    const d=j.data;
+    const milik = d.tersimpan
+      ? 'Cocok dengan akun tersimpan: <b>'+esc(d.email)+'<\/b>'
+      : (d.email ? 'Akun: <b>'+esc(d.email)+'<\/b> (tak ada di accounts.json)'
+                 : 'Key ini tak cocok dengan akun mana pun di accounts.json.');
+    show('ok','Sisa credit <b>'+numId(d.credit)+'<\/b>'+
+              (d.plan?' &middot; plan <b>'+esc(d.plan)+'<\/b>':'')+
+              '<span class="sub">'+milik+'<\/span>');
+    inp.value='';                 // jangan tinggalkan key di DOM
+  }finally{
+    btn.disabled=false; btn.textContent=label;
+  }
+}
+
+function clearKey(){
+  $('key-in').value='';
+  $('key-out').hidden=true;
+  $('key-out').innerHTML='';
+  $('key-in').focus();
 }
 
 async function refreshCredit(scope, one){
@@ -1648,6 +1746,10 @@ class Handler(BaseHTTPRequestHandler):
             email = qs.get("email", [""])[0]
             ok, err = delete_account(email)
             self._json({"ok": ok, "error": err})
+        elif u.path == "/api/check-key":
+            qs = self._post_form()
+            data, err = check_key(qs.get("key", [""])[0])
+            self._json({"ok": data is not None, "error": err, "data": data})
         elif u.path == "/api/refresh-credit":
             qs = self._post_form()
             emails = [e for e in qs.get("email", []) if e]

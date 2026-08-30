@@ -5,3 +5,8 @@ proxy.txt
 captcha*.png
 __pycache__/
 credit_check_*.csv
+# semua ini memuat email dan API key sungguhan
+credit_dump_*.csv
+credit_keys_*.csv
+dump_unique_keys.txt
+*_keys_dump.txt

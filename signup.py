@@ -178,6 +178,66 @@ def get_emails():
     return emails
 
 
+def credit_by_key(api_key, proxy=None, timeout=None):
+    """Sisa credit dari API key SAJA -- tanpa login, captcha, atau password.
+
+    Endpoint yang dipakai CLI resmi `gsk` (@genspark/cli): GET
+    /api/tool_cli/me dengan header X-Api-Key. Ini satu request dan tak
+    menyentuh Azure B2C sama sekali, jadi jauh lebih murah daripada login.
+
+    Balasannya: email, name, plan, personal_plan, org_plan, org_role,
+    credit_balance (float -- lebih presisi daripada angka di app web).
+
+    Melempar RuntimeError dengan pesan yang bisa dibaca pengguna. API key
+    TIDAK pernah masuk ke pesan error: pesan itu berakhir di log dan di UI.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("API key kosong")
+
+    opener = proxies.build_opener(proxy)
+    req = urllib.request.Request(
+        f"{APP}/api/tool_cli/me",
+        headers={"User-Agent": UA, "Accept": "application/json",
+                 "X-Api-Key": key})
+    try:
+        raw = opener.open(req, timeout=timeout or TIMEOUT).read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise RuntimeError("API key ditolak (tidak valid atau dicabut)") from None
+        raise RuntimeError(f"HTTP {e.code} dari /api/tool_cli/me") from None
+    try:
+        j = json.loads(raw)
+    except ValueError:
+        raise RuntimeError("balasan bukan JSON (mungkin diblokir Cloudflare)") from None
+    if not isinstance(j, dict) or "credit_balance" not in j:
+        raise RuntimeError(f"balasan tak memuat credit_balance: {str(j)[:120]}")
+    return j
+
+
+def key_cogen_id(api_key):
+    """cogen_id yang tertanam di dalam API key, tanpa jaringan. None kalau gagal.
+
+    Key `gsk-<base64url>` membungkus JSON {cogen_id, key_id, ctime, ...}.
+    Berguna untuk mencocokkan key lepas dengan akun di accounts.json tanpa
+    memanggil Genspark sama sekali.
+    """
+    body = (api_key or "").strip()
+    body = body[4:] if body[:4].lower() == "gsk-" else body
+    for pad in range(4):
+        try:
+            raw = base64.urlsafe_b64decode(body + "=" * pad)
+        except Exception:
+            continue
+        i, jx = raw.find(b"{"), raw.find(b"}")
+        if 0 <= i < jx:
+            try:
+                return json.loads(raw[i:jx + 1]).get("cogen_id")
+            except ValueError:
+                pass
+    return None
+
+
 class Client:
     def __init__(self, proxy=None):
         # satu proxy dipegang sepanjang sesi: B2C mengikat transaksi ke IP,
@@ -346,20 +406,25 @@ class Client:
     def get_user(self):
         return self.app_api("/api/user")
 
-    def set_data_retention(self, disabled=True):
-        """Matikan AI data retention. disabled=True -> Genspark tak menyimpan data.
+    def set_data_retention(self, on=True):
+        """Setel AI data retention. on=True -> Genspark BOLEH menyimpan data.
 
-        Endpoint sama dengan yang dipakai tombolnya di web (lihat HAR):
-        POST /api/user/update body {"disable_data_retention": true}. Balasannya
-        memuat nilai yang tersimpan, jadi yang dikembalikan adalah nilai itu --
-        bukan sekadar status==0 -- supaya "berhasil" berarti benar-benar
-        tersimpan, bukan cuma request diterima.
+        Nama field di Genspark terbalik dari nama argumen ini:
+        disable_data_retention=false berarti retention MENYALA. Pembalikan itu
+        dikurung di sini saja supaya pemanggilnya tak perlu ikut berpikir
+        terbalik. Endpoint sama dengan tombolnya di web (lihat HAR):
+        POST /api/user/update body {"disable_data_retention": false}.
+
+        Balasannya memuat nilai tersimpan, jadi yang dikembalikan adalah status
+        retention sesudah perubahan (bukan sekadar status==0) supaya "berhasil"
+        berarti benar-benar tersimpan, bukan cuma request diterima.
         """
         j = self.app_api("/api/user/update",
-                         {"disable_data_retention": bool(disabled)})
+                         {"disable_data_retention": not on})
         if j.get("status") != 0:
             raise RuntimeError(f"user/update failed: {j}")
-        return j.get("data", {}).get("cogen", {}).get("disable_data_retention")
+        dis = j.get("data", {}).get("cogen", {}).get("disable_data_retention")
+        return None if dis is None else not dis
 
     def create_checkout(self, price_id, price_name, plan_price, plan_type="subscription",
                         coupon_key=None):
@@ -477,8 +542,8 @@ def log(msg):
         print(msg, flush=True)
 
 
-def force_retention_off(c, email):
-    """Paksa data retention mati. Kembalikan True kalau tersimpan.
+def force_retention_on(c, email):
+    """Paksa data retention MENYALA. Kembalikan True kalau tersimpan.
 
     Sengaja tidak melempar: akun yang sudah dibayar dan sudah punya API key
     jangan hangus hanya karena satu setelan gagal diubah. Kegagalan dicatat di
@@ -486,7 +551,7 @@ def force_retention_off(c, email):
     """
     try:
         if c.set_data_retention(True) is True:
-            log(f"  [{email}] data retention: dimatikan")
+            log(f"  [{email}] data retention: dinyalakan")
             return True
         log(f"  [{email}] PERINGATAN data retention: Genspark tak "
             f"mengonfirmasi perubahan")
@@ -643,11 +708,11 @@ def interactive_signup(email, tries=EMAIL_TRIES):
 
 
 def phase_finish(email, c, cogen, accounts):
-    """Paralel-safe: retention off + checkout (kalau perlu) + API key + simpan."""
+    """Paralel-safe: retention on + checkout (kalau perlu) + API key + simpan."""
     cogen_id = cogen["id"]
     # Didahulukan sebelum checkout: menunggu kartu diisi manusia bisa lama, dan
-    # selama itu akun sudah aktif. Retention dimatikan sedini mungkin.
-    retention_off = force_retention_off(c, email)
+    # selama itu akun sudah aktif. Retention disetel sedini mungkin.
+    retention_on = force_retention_on(c, email)
     if cogen.get("plan", "free") != "free":
         st = {"payment_status": "paid", "plan": cogen["plan"]}
         log(f"  [{email}] payment: sudah {cogen['plan']}, skip checkout")
@@ -689,7 +754,7 @@ def phase_finish(email, c, cogen, accounts):
         "payment_status": st.get("payment_status"),
         "plan": c.get_user()["data"]["cogen"].get("plan"),
         "credit": credit,
-        "data_retention_disabled": retention_off,
+        "data_retention_on": retention_on,
         "proxy": c.proxy or "direct",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -845,7 +910,7 @@ def dump_one(accounts):
 
     # Setelah lolos ambang, bukan sebelum: akun di bawah ambang dibuang dan
     # tak pernah dipakai, jadi memaksa setelannya cuma memboroskan request.
-    retention_off = force_retention_off(c, used)
+    retention_on = force_retention_on(c, used)
 
     key_name = f"gk-{int(time.time() * 1000)}"
     token = c.create_api_key(key_name)
@@ -857,7 +922,7 @@ def dump_one(accounts):
         "payment_status": "none",   # dump: tak lewat checkout
         "plan": plan,
         "credit": credit,
-        "data_retention_disabled": retention_off,
+        "data_retention_on": retention_on,
         "proxy": c.proxy or "direct",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -971,24 +1036,48 @@ def check_credits(only=None):
         target = accounts
 
     def one(email, rec):
+        # Jalur cepat: API key cukup untuk membaca credit (satu request, tanpa
+        # B2C). Dipakai hanya kalau retention akun ini SUDAH menyala -- menyetel
+        # retention wajib punya sesi login, jadi akun yang belum beres tetap
+        # lewat jalur panjang supaya tombol ini tetap bisa memperbaikinya.
+        if rec.get("api_key") and rec.get("data_retention_on") is True:
+            try:
+                info = credit_by_key(rec["api_key"], proxy=PROXY_POOL.next())
+                return email, {
+                    "plan": info.get("plan"),
+                    "credit": info.get("credit_balance"),
+                    "data_retention_on": True,
+                    "status": None,          # /me tak melaporkan ini
+                    "period_end": None,
+                    "via": "api key",
+                }, None
+            except RuntimeError:
+                pass                          # key ditolak -> jatuh ke login
+
         c = Client()
         c.start()
         if not c.login(email, rec.get("password", PASSWORD)):
             return email, None, "login gagal"
         u = c.get_user()["data"]["cogen"]
-        # Sekalian paksa retention mati: sesinya sudah terbuka di sini, jadi
-        # tak perlu login kedua kali. Yang sudah mati dilewati -- akun lama
+        # Sekalian paksa retention menyala: sesinya sudah terbuka di sini, jadi
+        # tak perlu login kedua kali. Yang sudah menyala dilewati -- akun lama
         # yang sudah beres tak perlu request ulang tiap kali cek credit.
-        if u.get("disable_data_retention") is True:
-            retention_off = True
+        #
+        # Nilainya dibaca terbalik: disable_data_retention=false berarti
+        # retention MENYALA. `is False` dipakai, bukan `not ...`, karena akun
+        # yang belum pernah disetel bernilai null -- dan null harus tetap
+        # disetel, bukan dianggap sudah beres.
+        if u.get("disable_data_retention") is False:
+            retention_on = True
         else:
-            retention_off = force_retention_off(c, email)
+            retention_on = force_retention_on(c, email)
         return email, {
             "plan": u.get("plan"),
             "credit": c.credit_balance(),
-            "data_retention_disabled": retention_off,
+            "data_retention_on": retention_on,
             "status": u.get("personal_membership_ext", {}).get("status"),
             "period_end": u.get("personal_membership_ext", {}).get("current_period_end"),
+            "via": "login",
         }, None
 
     print(f"cek {len(target)} akun...")
@@ -1007,6 +1096,10 @@ def check_credits(only=None):
                 continue
             rows.append((email, info, err))
             if info:
+                # /api/tool_cli/me memberi float (mis. 888.6), app web memberi
+                # int. Dibulatkan ke bawah supaya sisa credit tak pernah
+                # dilaporkan lebih besar dari yang benar-benar ada.
+                info["credit"] = int(info.get("credit") or 0)
                 total += max(info["credit"], 0)
                 fresh[email] = info
 
@@ -1018,7 +1111,7 @@ def check_credits(only=None):
         if email in latest:
             latest[email]["credit"] = info["credit"]
             latest[email]["plan"] = info["plan"]
-            latest[email]["data_retention_disabled"] = info["data_retention_disabled"]
+            latest[email]["data_retention_on"] = info["data_retention_on"]
             latest[email]["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_accounts(latest)
 
@@ -1030,13 +1123,22 @@ def check_credits(only=None):
             print(f"  GAGAL {email}: {err} (credit lama dipertahankan)")
         else:
             print(f"  {email}")
-            print(f"        plan={info['plan']} credit={info['credit']} "
-                  f"status={info['status']} sampai={info['period_end']} "
-                  f"retention={'mati' if info['data_retention_disabled'] else 'MASIH AKTIF'}")
+            # Jalur API key tak melaporkan status langganan; mencetak
+            # "status=None sampai=None" bikin akun sehat tampak rusak, jadi
+            # kolom itu dilewati saja kalau memang tak ada datanya.
+            bagian = [f"plan={info['plan']}", f"credit={info['credit']}"]
+            if info.get("status") or info.get("period_end"):
+                bagian.append(f"status={info['status']}")
+                bagian.append(f"sampai={info['period_end']}")
+            bagian.append("retention="
+                          + ("nyala" if info["data_retention_on"]
+                             else "MASIH MATI"))
+            bagian.append(f"via={info.get('via') or 'login'}")
+            print("        " + " ".join(bagian))
     print()
-    ret_aktif = [e for e, i, x in rows if i and not i["data_retention_disabled"]]
-    if ret_aktif:
-        print(f"retention masih aktif di {len(ret_aktif)} akun; jalankan ulang "
+    ret_mati = [e for e, i, x in rows if i and not i["data_retention_on"]]
+    if ret_mati:
+        print(f"retention masih mati di {len(ret_mati)} akun; jalankan ulang "
               "cek credit untuk mencoba lagi")
 
     # Total di sini hanya menjumlahkan akun yang BERHASIL disegarkan, sedangkan
@@ -1044,7 +1146,11 @@ def check_credits(only=None):
     # tanpa penjelasan, jadi selisihnya terlihat seperti salah hitung. Kalau ada
     # yang gagal, sebutkan sisanya sekalian supaya angkanya bisa dicocokkan.
     tak_kena = [e for e, i, x in rows if not i]
+    lewat_key = sum(1 for v in fresh.values() if v.get("via") == "api key")
     print(f"berhasil dicek: {len(fresh)} akun, total credit {total}")
+    if lewat_key:
+        print(f"  di antaranya  : {lewat_key} lewat API key (tanpa login), "
+              f"{len(fresh) - lewat_key} lewat login")
     if tak_kena:
         print(f"gagal dicek   : {len(tak_kena)} akun (lihat GAGAL di atas); "
               "credit lamanya tidak ikut dijumlahkan di baris atas")
@@ -1057,9 +1163,31 @@ def check_credits(only=None):
               "<- angka inilah yang tampil di WebUI")
 
 
+def check_keys(keys):
+    """py signup.py key <gsk-...> [gsk-...] -> cek credit hanya dari API key."""
+    accounts = load_accounts()
+    # cogen_id -> email, untuk mengenali key lepas tanpa memanggil Genspark
+    milik = {v.get("cogen_id"): e for e, v in accounts.items() if v.get("cogen_id")}
+    for k in keys:
+        punya = milik.get(key_cogen_id(k))
+        try:
+            info = credit_by_key(k, proxy=PROXY_POOL.next())
+        except RuntimeError as ex:
+            print(f"  GAGAL {(punya or 'key ' + k[:12] + '...')}: {ex}")
+            continue
+        print(f"  {info.get('email') or punya or '(email tak diketahui)'}")
+        print(f"        plan={info.get('plan')} credit={info.get('credit_balance')}"
+              + (f" tersimpan sebagai {punya}" if punya else " (tidak ada di accounts.json)"))
+
+
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if arg in ("credit", "credits", "saldo"):
+    if arg in ("key", "keys", "apikey"):
+        if len(sys.argv) < 3:
+            print("pakai: py signup.py key <gsk-...> [gsk-...]")
+        else:
+            check_keys(sys.argv[2:])
+    elif arg in ("credit", "credits", "saldo"):
         # argumen sisanya = email tertentu saja; kosong -> semua akun
         check_credits(sys.argv[2:] or None)
     elif arg == "dump":
