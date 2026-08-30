@@ -995,12 +995,15 @@ def check_credits(only=None):
     print()
     rows, total, fresh = [], 0, {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for fut in as_completed([pool.submit(one, e, r)
-                                 for e, r in target.items()]):
+        # future -> email: kalau one() melempar, hasilnya tak memuat email dan
+        # akun yang gagal jadi tak bisa ditelusuri ("? : timeout"). Petanya
+        # dibuat di sini supaya nama akunnya tetap terlaporkan.
+        futs = {pool.submit(one, e, r): e for e, r in target.items()}
+        for fut in as_completed(futs):
             try:
                 email, info, err = fut.result()
             except Exception as ex:
-                rows.append(("?", None, str(ex)[:60]))
+                rows.append((futs[fut], None, f"{type(ex).__name__}: {ex}"[:80]))
                 continue
             rows.append((email, info, err))
             if info:
@@ -1019,20 +1022,39 @@ def check_credits(only=None):
             latest[email]["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_accounts(latest)
 
-    for email, info, err in sorted(rows, key=lambda r: r[0]):
+    # Yang gagal dikelompokkan di atas: kalau berbaur di antara 56 baris sukses,
+    # satu akun yang gagal mudah terlewat -- dan itulah yang membuat total di
+    # sini tampak tak cocok dengan WebUI.
+    for email, info, err in sorted(rows, key=lambda r: (r[1] is not None, r[0])):
         if err:
-            print(f"  GAGAL {email}: {err}")
+            print(f"  GAGAL {email}: {err} (credit lama dipertahankan)")
         else:
             print(f"  {email}")
             print(f"        plan={info['plan']} credit={info['credit']} "
                   f"status={info['status']} sampai={info['period_end']} "
                   f"retention={'mati' if info['data_retention_disabled'] else 'MASIH AKTIF'}")
     print()
-    gagal = [e for e, i, x in rows if i and not i["data_retention_disabled"]]
-    if gagal:
-        print(f"retention masih aktif di {len(gagal)} akun; jalankan ulang "
+    ret_aktif = [e for e, i, x in rows if i and not i["data_retention_disabled"]]
+    if ret_aktif:
+        print(f"retention masih aktif di {len(ret_aktif)} akun; jalankan ulang "
               "cek credit untuk mencoba lagi")
-    print(f"total credit: {total}")
+
+    # Total di sini hanya menjumlahkan akun yang BERHASIL disegarkan, sedangkan
+    # WebUI menjumlahkan semua akun di accounts.json. Dulu keduanya dicetak
+    # tanpa penjelasan, jadi selisihnya terlihat seperti salah hitung. Kalau ada
+    # yang gagal, sebutkan sisanya sekalian supaya angkanya bisa dicocokkan.
+    tak_kena = [e for e, i, x in rows if not i]
+    print(f"berhasil dicek: {len(fresh)} akun, total credit {total}")
+    if tak_kena:
+        print(f"gagal dicek   : {len(tak_kena)} akun (lihat GAGAL di atas); "
+              "credit lamanya tidak ikut dijumlahkan di baris atas")
+    # Dihitung dari accounts.json, bukan total+sisa: kalau yang disegarkan cuma
+    # sebagian (refresh baris terpilih), akun di luar pilihan tetap ikut
+    # dijumlahkan WebUI dan takkan pernah muncul di rows.
+    semua = sum(int(v.get("credit") or 0) for v in latest.values())
+    if semua != total:
+        print(f"total semua   : {semua} dari {len(latest)} akun tersimpan "
+              "<- angka inilah yang tampil di WebUI")
 
 
 if __name__ == "__main__":
