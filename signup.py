@@ -346,6 +346,21 @@ class Client:
     def get_user(self):
         return self.app_api("/api/user")
 
+    def set_data_retention(self, disabled=True):
+        """Matikan AI data retention. disabled=True -> Genspark tak menyimpan data.
+
+        Endpoint sama dengan yang dipakai tombolnya di web (lihat HAR):
+        POST /api/user/update body {"disable_data_retention": true}. Balasannya
+        memuat nilai yang tersimpan, jadi yang dikembalikan adalah nilai itu --
+        bukan sekadar status==0 -- supaya "berhasil" berarti benar-benar
+        tersimpan, bukan cuma request diterima.
+        """
+        j = self.app_api("/api/user/update",
+                         {"disable_data_retention": bool(disabled)})
+        if j.get("status") != 0:
+            raise RuntimeError(f"user/update failed: {j}")
+        return j.get("data", {}).get("cogen", {}).get("disable_data_retention")
+
     def create_checkout(self, price_id, price_name, plan_price, plan_type="subscription",
                         coupon_key=None):
         """Return checkout.stripe.com URL. coupon_key='first_month:<cogen_id>' -> $0."""
@@ -460,6 +475,24 @@ def save_accounts(acc):
 def log(msg):
     with IO_LOCK:
         print(msg, flush=True)
+
+
+def force_retention_off(c, email):
+    """Paksa data retention mati. Kembalikan True kalau tersimpan.
+
+    Sengaja tidak melempar: akun yang sudah dibayar dan sudah punya API key
+    jangan hangus hanya karena satu setelan gagal diubah. Kegagalan dicatat di
+    log dan di accounts.json, jadi bisa diulang lewat "Cek ulang credit".
+    """
+    try:
+        if c.set_data_retention(True) is True:
+            log(f"  [{email}] data retention: dimatikan")
+            return True
+        log(f"  [{email}] PERINGATAN data retention: Genspark tak "
+            f"mengonfirmasi perubahan")
+    except Exception as ex:
+        log(f"  [{email}] PERINGATAN data retention gagal: {str(ex)[:120]}")
+    return False
 
 
 def with_proxy_retry(fn, email, tries=None):
@@ -610,8 +643,11 @@ def interactive_signup(email, tries=EMAIL_TRIES):
 
 
 def phase_finish(email, c, cogen, accounts):
-    """Paralel-safe: checkout (kalau perlu) + API key + simpan."""
+    """Paralel-safe: retention off + checkout (kalau perlu) + API key + simpan."""
     cogen_id = cogen["id"]
+    # Didahulukan sebelum checkout: menunggu kartu diisi manusia bisa lama, dan
+    # selama itu akun sudah aktif. Retention dimatikan sedini mungkin.
+    retention_off = force_retention_off(c, email)
     if cogen.get("plan", "free") != "free":
         st = {"payment_status": "paid", "plan": cogen["plan"]}
         log(f"  [{email}] payment: sudah {cogen['plan']}, skip checkout")
@@ -653,6 +689,7 @@ def phase_finish(email, c, cogen, accounts):
         "payment_status": st.get("payment_status"),
         "plan": c.get_user()["data"]["cogen"].get("plan"),
         "credit": credit,
+        "data_retention_disabled": retention_off,
         "proxy": c.proxy or "direct",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -806,6 +843,10 @@ def dump_one(accounts):
     if credit < DUMP_MIN_CREDIT:
         return used, credit, plan, False
 
+    # Setelah lolos ambang, bukan sebelum: akun di bawah ambang dibuang dan
+    # tak pernah dipakai, jadi memaksa setelannya cuma memboroskan request.
+    retention_off = force_retention_off(c, used)
+
     key_name = f"gk-{int(time.time() * 1000)}"
     token = c.create_api_key(key_name)
     rec = {
@@ -816,6 +857,7 @@ def dump_one(accounts):
         "payment_status": "none",   # dump: tak lewat checkout
         "plan": plan,
         "credit": credit,
+        "data_retention_disabled": retention_off,
         "proxy": c.proxy or "direct",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -934,9 +976,17 @@ def check_credits(only=None):
         if not c.login(email, rec.get("password", PASSWORD)):
             return email, None, "login gagal"
         u = c.get_user()["data"]["cogen"]
+        # Sekalian paksa retention mati: sesinya sudah terbuka di sini, jadi
+        # tak perlu login kedua kali. Yang sudah mati dilewati -- akun lama
+        # yang sudah beres tak perlu request ulang tiap kali cek credit.
+        if u.get("disable_data_retention") is True:
+            retention_off = True
+        else:
+            retention_off = force_retention_off(c, email)
         return email, {
             "plan": u.get("plan"),
             "credit": c.credit_balance(),
+            "data_retention_disabled": retention_off,
             "status": u.get("personal_membership_ext", {}).get("status"),
             "period_end": u.get("personal_membership_ext", {}).get("current_period_end"),
         }, None
@@ -965,6 +1015,7 @@ def check_credits(only=None):
         if email in latest:
             latest[email]["credit"] = info["credit"]
             latest[email]["plan"] = info["plan"]
+            latest[email]["data_retention_disabled"] = info["data_retention_disabled"]
             latest[email]["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_accounts(latest)
 
@@ -974,8 +1025,13 @@ def check_credits(only=None):
         else:
             print(f"  {email}")
             print(f"        plan={info['plan']} credit={info['credit']} "
-                  f"status={info['status']} sampai={info['period_end']}")
+                  f"status={info['status']} sampai={info['period_end']} "
+                  f"retention={'mati' if info['data_retention_disabled'] else 'MASIH AKTIF'}")
     print()
+    gagal = [e for e, i, x in rows if i and not i["data_retention_disabled"]]
+    if gagal:
+        print(f"retention masih aktif di {len(gagal)} akun; jalankan ulang "
+              "cek credit untuk mencoba lagi")
     print(f"total credit: {total}")
 
 

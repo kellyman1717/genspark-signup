@@ -734,6 +734,9 @@ PAGE = r"""<!doctype html>
        font-weight:550;background:var(--sunken);color:var(--ink-2);
        border:1px solid var(--line-2);white-space:nowrap}
   .tag.good{background:var(--act-soft);color:var(--act);border-color:#A9D6CC}
+  /* amber, bukan merah: merah dipakai khusus untuk aksi merusak (hapus/stop).
+     Ini butuh perhatian, tapi bukan tombol berbahaya. */
+  .tag.bad{background:#FDF3E0;color:var(--warn);border-color:#E8CFA0}
 
   .keycell{display:flex;align-items:center;gap:4px}
   .keytext{font-family:var(--mono);font-size:12px;max-width:210px;
@@ -1290,6 +1293,18 @@ function toggleAllKeys(){
 
 function clearSel(){ SEL.clear(); renderRows(); }
 
+// Tiga keadaan, bukan dua: true = sudah dimatikan, false = dicoba tapi gagal
+// (perlu perhatian), undefined = akun dibuat sebelum fitur ini ada, jadi
+// statusnya memang belum diketahui -- jangan ditampilkan seolah bermasalah.
+function retTag(v){
+  const r=v.data_retention_disabled;
+  if(r===true)  return ' <span class="tag good" title="AI data retention '+
+    'sudah dimatikan">retention off</span>';
+  if(r===false) return ' <span class="tag bad" title="Gagal mematikan AI data '+
+    'retention. Tekan Cek ulang credit untuk mencoba lagi.">retention aktif</span>';
+  return '';
+}
+
 function renderRows(){
   const el=$('accounts'), rows=filtered();
   const total=Object.keys(ACC).length;
@@ -1333,7 +1348,7 @@ function renderRows(){
         esc(email)+'"'+(on?' checked':'')+' aria-label="Pilih '+esc(email)+'"></td>'+
       '<td class="c-mail" data-h="Email">'+esc(email)+'</td>'+
       '<td data-h="Plan">'+(plan?'<span class="tag good">'+esc(plan)+
-        '</span>':'<span class="tag">—</span>')+'</td>'+
+        '</span>':'<span class="tag">—</span>')+retTag(v)+'</td>'+
       '<td class="c-num" data-h="Credit">'+
         (v.credit==null||v.credit===''?'—':numId(v.credit))+'</td>'+
       '<td data-h="API key"><div class="keycell">'+
