@@ -22,6 +22,8 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import proxies  # dipakai agar hitungan proxy di UI sama dengan hitungan signup.py
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 ACCOUNTS = os.path.join(SCRIPT_DIR, "accounts.json")
@@ -139,12 +141,36 @@ def read_env():
     return cfg
 
 
+def flatten(value):
+    """Nilai banyak baris -> satu baris berkoma, duplikat dan baris kosong dibuang.
+
+    proxies.parse() memecah baik koma maupun baris, jadi koma aman dipakai
+    sebagai pemisah di .env yang formatnya satu kunci per baris.
+    """
+    text = str(value)
+    if "\n" not in text and "\r" not in text:
+        return text.strip()
+    seen, out = set(), []
+    for part in text.replace(",", "\n").splitlines():
+        part = part.strip()
+        if part and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return ",".join(out)
+
+
 def save_env(values):
     """Tulis nilai ke .env, pertahankan baris lain + urutan + komentar.
 
     Nilai kosong = kunci dihapus dari .env, supaya signup.py memakai
     defaultnya (cocok dengan keterangan "kosongkan untuk otomatis").
+
+    Satu kunci = satu baris, jadi nilai dari <textarea> yang berisi banyak
+    baris HARUS dirapatkan lebih dulu. Tanpa ini newline mentah ikut tertulis
+    dan baris ke-2 dan seterusnya jadi baris tanpa "=" yang dibuang diam-diam
+    oleh read_env maupun signup.load_env -- proxy hilang tanpa pesan error.
     """
+    values = {k: flatten(v) for k, v in values.items()}
     lines = []
     if os.path.exists(ENV_FILE):
         with open(ENV_FILE, encoding="utf-8") as f:
@@ -197,6 +223,22 @@ def count_lines(path, skip_comments=True):
                 continue
             n += 1
     return n
+
+
+def count_proxies(env):
+    """Berapa proxy yang benar-benar akan dipakai signup.py.
+
+    Sengaja memakai proxies.load persis seperti signup.py, jadi angka di layar
+    tak bisa berbeda dari kenyataan. Dulu di sini count_lines(proxy.txt) saja,
+    sehingga proxy yang diisi lewat form -- yang tersimpan sebagai kunci PROXY
+    di .env -- selalu terbaca 0 dan pengguna menyangka isinya tak masuk.
+    Baris rusak membuat proxies.load melempar ValueError; -1 dipakai sebagai
+    penanda "tak terbaca" supaya UI bisa memberi tahu, bukan diam saja.
+    """
+    try:
+        return len(proxies.load(env.get("PROXY", ""), PROXY_FILE))
+    except (ValueError, OSError):
+        return -1
 
 
 # --------------------------------------------------------------------------
@@ -372,13 +414,14 @@ def delete_account(email):
 
 
 def state():
+    env = read_env()
     return {
-        "settings": read_env(),
+        "settings": env,
         "accounts": read_accounts(),
         "running": is_running(),
         "mode": RUN.mode if is_running() else None,
         "akun_lines": count_lines(AKUN_FILE),
-        "proxy_lines": count_lines(PROXY_FILE),
+        "proxy_lines": count_proxies(env),
         "log_seq": RUN.seq,
         "pid": RUN.proc.pid if is_running() else None,
     }
@@ -1099,16 +1142,32 @@ async function pollPending(){
 }
 
 /* ---------------- state ---------------- */
+let cfgFilled=false;
+
 async function loadState(){
   try{
     const s=await jget('/api/state');
-    const cfg=s.settings;
-    document.querySelectorAll('#cfg [name], #dump-extra [name]').forEach(el=>{
-      if(el.name in cfg && el!==document.activeElement)
-        el.value=cfg[el.name]??'';
-    });
+    // Isi form SEKALI saja, saat halaman pertama dibuka. Kalau diisi ulang
+    // tiap poll (2.5s), angka yang baru diketik pengguna akan tertimpa balik
+    // oleh nilai lama dari .env begitu field kehilangan fokus. Menjaga
+    // activeElement saja tidak cukup: klik ke mana pun langsung melepas fokus.
+    if(!cfgFilled){
+      cfgFilled=true;
+      const cfg=s.settings;
+      document.querySelectorAll('#cfg [name], #dump-extra [name]').forEach(el=>{
+        if(!(el.name in cfg)) return;
+        const v=cfg[el.name]??'';
+        // .env cuma bisa satu baris per kunci, jadi daftar disimpan berkoma.
+        // Di textarea dikembalikan satu per baris supaya enak dibaca/diedit.
+        el.value = el.tagName==='TEXTAREA' ? v.split(',').join('\n') : v;
+      });
+    }
     $('cnt-akun').textContent=s.akun_lines;
-    $('cnt-proxy').textContent=s.proxy_lines;
+    // -1 = proxies.load menolak isinya; jangan tampilkan "-1 proxy"
+    $('cnt-proxy').textContent = s.proxy_lines<0 ? '!' : s.proxy_lines;
+    $('cnt-proxy').title = s.proxy_lines<0
+      ? 'Ada baris proxy yang formatnya tak dikenali. Periksa di tab Setting.'
+      : 'proxy dari .env + proxy.txt, duplikat dibuang';
     $('cnt-acc').textContent=Object.keys(s.accounts||{}).length;
     renderRun(s);
     renderAccounts(s.accounts, s.running);
@@ -1132,6 +1191,17 @@ async function save(loud){
         j.ok?'ok':'err');
   return j.ok;
 }
+
+// Aturan dump ada di tab Jalankan, tapi tombol Simpan cuma di tab Setting.
+// Simpan sendiri begitu field selesai diubah, supaya nilainya tidak hilang
+// hanya karena pengguna tak menyeberang tab untuk menekan Simpan.
+document.addEventListener('change', (ev)=>{
+  const el=ev.target;
+  if(!el.name || !el.closest('#dump-extra')) return;
+  save(false).then(ok=>{
+    if(ok) say('Aturan dump disimpan.','ok');
+  });
+});
 
 async function startRun(){
   const pw=$('PASSWORD');
